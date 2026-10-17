@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="theme-color" content="#f4f6fa">
+    <title>Agent Monitor</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <script type="module" src="/app.js"></script>
+</head>
+<body>
+    <aside id="sidebar" aria-label="会話一覧">
+        <header class="brand"><strong>Agent Monitor</strong></header>
+        <button id="launch-open">新しいCodex会話</button>
+        <section id="notifications" aria-label="通知">
+            <p id="notification-state" class="notice" role="status">通知を確認中…</p>
+            <div class="notification-actions"><button id="notification-toggle" hidden disabled>通知を有効にする</button><button id="notification-test" hidden>テスト送信</button></div>
+        </section>
+        <label class="search-label" for="search">会話を探す</label>
+        <input id="search" type="search" placeholder="プロジェクト・会話名" autocomplete="off">
+        <p id="connection" class="notice" role="status">接続中…</p>
+        <nav id="thread-list" aria-label="会話一覧"></nav>
+    </aside>
+    <main id="conversation">
+        <header class="conversation-header">
+            <button id="back" class="mobile-only" aria-label="会話一覧へ戻る">← 一覧</button>
+            <div class="heading"><h1 id="title">会話を選んでください</h1><p id="project"></p></div>
+            <span id="status" class="status"></span>
+            <button id="terminal-open" disabled>端末</button>
+        </header>
+        <div id="reading-line"><span id="reading-position">過去の出力から続きを確認できます</span><button id="latest" hidden>新着へ ↓</button></div>
+        <section id="history" aria-label="会話履歴" tabindex="0">
+            <button id="older" hidden>前の履歴を読む</button>
+            <p id="history-notice" class="notice" role="status">左の一覧からPCで開いている会話を選びます。</p>
+            <div id="turns"></div>
+        </section>
+        <section id="questions" aria-label="Codexからの質問" hidden></section>
+        <section id="composer" aria-label="指示の入力">
+            <div id="queue" aria-label="待機中の指示"></div>
+            <p id="send-state" role="status">会話を選ぶと指示を入力できます。</p>
+            <button id="composer-terminal" hidden>端末を開く</button>
+            <button id="resolve" hidden>PCで結果を確認して下書きを解除</button>
+            <textarea id="draft" rows="3" maxlength="32000" aria-label="次の指示" placeholder="次の指示を書く" disabled></textarea>
+            <div class="composer-actions"><span>Enterで改行</span><button id="send" disabled>指示を送信</button></div>
+        </section>
+    </main>
+    <dialog id="launch-dialog" aria-labelledby="launch-title">
+        <header><h2 id="launch-title">新しいCodex会話</h2><button id="launch-close">閉じる</button></header>
+        <form id="launch-form">
+            <label for="launch-path">PCの作業ディレクトリ</label>
+            <input id="launch-path" required maxlength="4096" placeholder="~/git/agent-monitor" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="launch-help launch-state">
+            <p id="launch-help" class="notice">PCにある絶対パスか~/で始まるパスを入力します。同じ場所のworkspaceに新しいタブを開きます。</p>
+            <button id="launch-submit" type="submit">Codexを起動</button>
+        </form>
+        <p id="launch-state" class="notice" role="status"></p>
+        <button id="launch-terminal" hidden>起動した端末を開く</button>
+        <button id="launch-resolve" hidden>PCで起動結果を確認して解除</button>
+    </dialog>
+    <dialog id="terminal-dialog" aria-labelledby="terminal-title">
+        <header><h2 id="terminal-title">PCの端末</h2><button id="terminal-close">閉じる</button></header>
+        <p class="notice">承認や質問への回答、特殊キーの操作に使います。</p>
+        <label for="pane-select">操作する端末</label>
+        <select id="pane-select"><option value="">端末を選んでください</option></select>
+        <button id="bind">この端末を表示</button>
+        <p id="terminal-result" class="notice" role="status" hidden></p>
+        <p id="terminal-state" role="status"></p>
+        <button id="terminal-resolve" hidden>PCで端末操作の結果を確認して解除</button>
+        <pre id="terminal-screen" tabindex="0" aria-label="現在の端末表示"></pre>
+        <button id="terminal-refresh" disabled>端末表示を更新</button>
+        <div id="keys" aria-label="特殊キー"></div>
+        <label for="terminal-text">文字を入力</label>
+        <input id="terminal-text" maxlength="4000" autocomplete="off" placeholder="文字を入力した後、Enterを別に送ります">
+        <button id="terminal-send" disabled>文字を送信</button>
+    </dialog>
+</body>
+</html>

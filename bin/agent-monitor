@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+launcher=$0
+while [ -L "$launcher" ]; do
+    directory=$(CDPATH= cd -P "$(dirname "$launcher")" && pwd)
+    target=$(readlink "$launcher")
+    case "$target" in
+        /*) launcher=$target ;;
+        *) launcher=$directory/$target ;;
+    esac
+done
+repo=$(CDPATH= cd -P "$(dirname "$launcher")/.." && pwd)
+
+for node in "$(command -v node || :)" /opt/homebrew/opt/node@24/bin/node /usr/local/opt/node@24/bin/node; do
+    if [ -x "$node" ] && "$node" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)' >/dev/null 2>&1; then
+        exec "$node" "$repo/src/cli.js" "$@"
+    fi
+done
+
+printf '%s\n' 'agent-monitor requires Node.js 24 or later. Put it on PATH, or install it on macOS with: brew install node@24' >&2
+exit 1
