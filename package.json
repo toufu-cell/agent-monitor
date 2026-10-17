@@ -1,0 +1,29 @@
+{
+    "name": "agent-monitor",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "engines": { "node": ">=24" },
+    "packageManager": "pnpm@10.33.0",
+    "scripts": {
+        "build": "node scripts/build.js",
+        "start": "node src/cli.js",
+        "check": "node scripts/check.js",
+        "test": "node --test test/integration.test.js test/launch.test.js test/model.test.js test/ui.test.js test/presence.test.js test/notifications.test.js",
+        "test:browser": "node --test test/browser.test.js",
+        "lint:text": "node scripts/lint-text.js"
+    },
+    "dependencies": {
+        "dompurify": "^3.3.0",
+        "marked": "^16.4.0",
+        "qrcode": "^1.5.4",
+        "web-push": "^3.6.7",
+        "ws": "^8.18.3"
+    },
+    "devDependencies": {
+        "esbuild": "^0.25.11",
+        "jsdom": "^27.0.1",
+        "playwright": "^1.56.0"
+    },
+    "pnpm": { "onlyBuiltDependencies": ["esbuild"] }
+}
