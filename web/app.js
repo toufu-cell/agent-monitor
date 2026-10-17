@@ -325,6 +325,7 @@ async function selectThread(id) {
     const cache = cacheFor(id);
     cache.thread = thread;
     cache.stateReady = false;
+    cache.usage = null;
     $('title').textContent = thread.title; $('project').textContent = thread.cwd;
     $('draft').value = drafts[id] || ''; $('draft').disabled = false;
     $('terminal-open').disabled = false;
@@ -333,6 +334,7 @@ async function selectThread(id) {
     document.body.classList.add('reading');
     renderList(); renderHistory(cache, false, true); renderComposer();
     restoreReadingPosition(cache);
+    refreshUsage();
     await refreshSelected();
 }
 
@@ -414,6 +416,29 @@ function readingPosition() {
     }
 }
 
+function renderUsage() {
+    const cache = cacheFor(selected);
+    $('usage').hidden = cache.thread?.provider !== 'codex';
+    const usage = cache.closed || !cache.stateReady ? null : cache.usage;
+    $('usage').textContent = `コンテキスト${usage?.contextUsedPercent == null ? '不明' : `${usage.contextUsedPercent}%使用`} · 週残り${usage?.weeklyLeftPercent == null ? '不明' : `${usage.weeklyLeftPercent}%`}`;
+}
+
+async function refreshUsage() {
+    if (!selected) return;
+    const id = selected, captured = generation, cache = cacheFor(id);
+    if (cache.closed || cache.thread?.provider !== 'codex' || cache.usageFetching) return;
+    cache.usageFetching = true;
+    const request = cache.usageRequest = Symbol();
+    try {
+        const usage = await api(`threads/${encodeURIComponent(id)}/usage`);
+        if (!currentSelection(selected, generation, id, captured) || cache.closed || cache.usageRequest !== request) return;
+        cache.usage = usage;
+        renderUsage();
+    } catch {
+        if (currentSelection(selected, generation, id, captured) && cache.usageRequest === request) { cache.usage = null; renderUsage(); }
+    } finally { cache.usageFetching = false; }
+}
+
 function renderComposer() {
     if (!selected) return;
     const cache = cacheFor(selected);
@@ -433,6 +458,7 @@ function renderComposer() {
     $('composer-terminal').hidden = cache.closed || !cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
     $('queue').replaceChildren(...cache.queue.map(item => node('p', `待機中の指示\n${item.text}`)));
     renderQuestions();
+    renderUsage();
 }
 
 function questionKey(id, question) { return JSON.stringify([id, question.turnId, question.itemId, question.index]); }
@@ -548,6 +574,7 @@ async function refreshSelected() {
         ]);
         if (!currentSelection(selected, generation, id, captured)) return;
         cache.stateReady = state.status === 'fulfilled';
+        if (!cache.stateReady) { cache.usageRequest = null; cache.usage = null; }
         cache.historyReady = history.status === 'fulfilled';
         if (cache.stateReady) {
             cache.thread = state.value.thread; cache.queue = state.value.queue;
@@ -570,6 +597,7 @@ async function refreshSelected() {
         renderHistory(cache); renderComposer();
     } catch (error) {
         if (!currentSelection(selected, generation, id, captured)) return;
+        cache.usageRequest = null; cache.usage = null;
         cache.stateReady = false; cache.error = error.message; renderHistory(cache); renderComposer();
     } finally { cache.fetching = false; }
 }
@@ -643,6 +671,7 @@ async function poll() {
             cache.closed = !threads.some(thread => thread.id === selected);
             if (cache.closed) {
                 generation++;
+                cache.usage = null;
                 cache.stateReady = false;
                 if (terminalOwner?.resource === 'threads') closeTerminal();
                 renderComposer();
@@ -657,10 +686,11 @@ async function poll() {
             catch { settleQuestion(key, { requestId: operation.requestId, state: 'unknown' }); }
         }
         terminalControls();
+        refreshUsage();
         await refreshSelected();
     } catch (error) {
         $('connection').textContent = `接続を確認してください。${error.message}`; $('connection').classList.add('error');
-        if (selected) { cacheFor(selected).stateReady = false; renderComposer(); }
+        if (selected) { cacheFor(selected).usageRequest = null; cacheFor(selected).usage = null; cacheFor(selected).stateReady = false; renderComposer(); }
     } finally { polling = false; }
 }
 
