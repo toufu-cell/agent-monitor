@@ -11,6 +11,63 @@ import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { mergeTurns } from '../web/model.js';
 import { createMonitorServer } from '../src/server.js';
 
+test('usage HTTP reads only the verified Codex footer and validates percentages and target identity', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { state, request } = f;
+    const unknown = { contextUsedPercent: null, weeklyLeftPercent: null };
+    assert.equal((await request('/api/threads/a/usage', undefined, { Authorization: '' })).status, 401);
+    await request('/api/threads');
+    const screen = footer => codexScreen().replace('Context 5% used', footer);
+    for (const [footer, expected] of [
+        ['Context 64% used · weekly 85% left', { contextUsedPercent: 64, weeklyLeftPercent: 85 }],
+        ['Context 0% used · weekly 100% left', { contextUsedPercent: 0, weeklyLeftPercent: 100 }],
+        ['Context 100% used', { contextUsedPercent: 100, weeklyLeftPercent: null }],
+        ['weekly 0% left', { contextUsedPercent: null, weeklyLeftPercent: 0 }],
+        ...['Context 101% used · weekly -1% left', 'Context NaN% used · weekly Infinity% left',
+            'Context 80% left · weekly 20% used', 'Context 1e1% used · weekly 85x% left',
+            'Context 5% used · Context 6% used · weekly 85% left · weekly 90% left', 'short status'].map(value => [value, unknown]),
+    ]) {
+        state.ansiScreen = screen(footer);
+        const result = await request('/api/threads/a/usage');
+        assert.equal(result.status, 200); assert.deepEqual(result.body, expected);
+    }
+    state.ansiScreen = 'Context 90% used · weekly 20% left\n' + codexScreen('Context 70% used · weekly 30% left', false).replace('Context 5% used', 'status');
+    assert.deepEqual((await request('/api/threads/a/usage')).body, unknown);
+    state.ansiScreen = screen('Context 64% used · weekly 85% left');
+    state.readPaneId = 'w2:p2';
+    assert.deepEqual((await request('/api/threads/a/usage')).body, unknown);
+    state.readPaneId = null;
+    for (const text of [undefined, 'Context 64% used · weekly 85% left', screen('Context 64% used').replaceAll('›', '>')]) {
+        state.ansiScreen = text;
+        assert.deepEqual((await request('/api/threads/a/usage')).body, unknown);
+    }
+    state.ansiScreen = screen('Context 64% used · weekly 85% left');
+    state.ignoreHerdrMethod = 'pane.read';
+    assert.deepEqual((await request('/api/threads/a/usage')).body, unknown);
+    state.ignoreHerdrMethod = null;
+    const gate = { ...Promise.withResolvers(), entered: Promise.withResolvers(), paneId: 'w1:p1' };
+    t.after(() => gate.resolve()); state.readGate = gate;
+    const reading = request('/api/threads/a/usage');
+    await gate.entered.promise;
+    state.resources.get(200).ports = new Set([41002]);
+    gate.resolve(); assert.deepEqual((await reading).body, unknown);
+    state.resources.get(200).ports = new Set([41001]);
+    await request('/api/threads');
+    state.panes.push({ ...state.panes[0], pane_id: 'w3:p3' });
+    assert.deepEqual((await request('/api/threads/a/usage')).body, unknown);
+    state.panes.pop();
+    state.resources.get(200).ports.add(41002);
+    assert.equal((await request('/api/threads/a/usage')).status, 409);
+    state.resources.get(200).ports = new Set([41001]);
+    const c = await f.addClaude();
+    await request('/api/threads');
+    const reads = state.herdrCalls.filter(call => call.method === 'pane.read').length;
+    assert.deepEqual((await request(`/api/threads/${c.id}/usage`)).body, unknown);
+    assert.equal(state.herdrCalls.filter(call => call.method === 'pane.read').length, reads);
+    assert.equal(state.writes.length, 0);
+    assert.ok(state.herdrCalls.filter(call => call.method === 'pane.read').every(call => call.params.format === 'ansi' && call.params.strip_ansi === false));
+});
+
 test('async question history and pending state recognize exact replies, IDE context and legacy IDs', async t => {
     const f = await fixture(); t.after(() => f.close());
     const { state, request } = f;

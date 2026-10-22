@@ -174,7 +174,7 @@ export async function fixture({ now = Date.now } = {}) {
                     result = { type: 'pane_process_info', process_info: { pane_id: request.params.pane_id, ...process } }; break;
                 }
                 case 'pane.read': {
-                    result = { type: 'pane_read', read: { text: request.params.format === 'ansi' ? state.ansiScreen : state.screen, pane_id: request.params.pane_id } };
+                    result = { type: 'pane_read', read: { text: request.params.format === 'ansi' ? state.ansiScreen : state.screen, pane_id: state.readPaneId ?? request.params.pane_id } };
                     const gate = state.readGate;
                     if (gate?.paneId === request.params.pane_id) {
                         state.readGate = null;

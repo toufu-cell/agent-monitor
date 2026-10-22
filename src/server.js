@@ -87,6 +87,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     if (resource === 'launches' && action === 'terminal' && segments.length === 4) return json(200, await service.terminal(id, requireString(url.searchParams.get('bindingId')), 'launch'));
                     if (resource === 'threads' && segments.length === 4) {
                         if (action === 'state') return json(200, await service.questionState(id));
+                        if (action === 'usage') return json(200, await service.usage(id));
                         if (action === 'history') return json(200, await service.history(id, url.searchParams.get('cursor'), url.searchParams.get('until')));
                         if (action === 'panes') return json(200, { panes: await service.panes(id) });
                         if (action === 'terminal') return json(200, await service.terminal(id, requireString(url.searchParams.get('bindingId'))));

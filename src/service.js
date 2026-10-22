@@ -5,7 +5,7 @@ import { basename, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isCodexTui, readPresence, originPort } from './presence.js';
 import { UpstreamError } from './rpc.js';
-import { codexInputState, claudeInputState } from './codex-input.js';
+import { codexInputState, claudeInputState, codexUsage } from './codex-input.js';
 import { ClaudeReader, isClaudeProcess, claudeMatch, claudeThread } from './claude.js';
 
 export class HttpError extends Error {
@@ -303,6 +303,25 @@ export class MonitorService {
         const current = summary(thread, sources);
         this.known.set(id, current);
         return current;
+    }
+
+    async usage(id) {
+        const unknown = { contextUsedPercent: null, weeklyLeftPercent: null };
+        const sources = await this.sources();
+        const thread = await this.thread(id, sources);
+        const panes = sources.panes.filter(pane => pane.threadId === id);
+        if (thread.provider !== 'codex' || panes.length !== 1 || panes[0].tuis.length !== 1) return unknown;
+        const pane = panes[0];
+        try {
+            const { read } = await this.herdr.call('pane.read', { pane_id: pane.pane_id, source: 'visible', format: 'ansi', strip_ansi: false });
+            if (read?.pane_id !== pane.pane_id) return unknown;
+            const current = await this.sources();
+            await this.thread(id, current);
+            const matches = current.panes.filter(candidate => candidate.threadId === id);
+            if (matches.length !== 1 || !samePane(pane, matches[0])
+                || processFingerprint(pane, pane.process, id) !== processFingerprint(matches[0], matches[0].process, id)) return unknown;
+            return codexUsage(read.text);
+        } catch { return unknown; }
     }
 
     async history(id, cursor, until) {

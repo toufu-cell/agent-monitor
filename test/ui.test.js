@@ -96,6 +96,75 @@ async function mount(t, f, manualPolling = false, stored = {}, count = 2) {
     return { window, $ };
 }
 
+test('usage polling stays independent of sending and rejects stale selections and failed connections', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const c = await f.addClaude();
+    f.state.ansiScreen = codexScreen().replace('Context 5% used', 'Context 64% used · weekly 85% left');
+    const { window, $ } = await mount(t, f, false, {}, 3);
+    const fetch = window.fetch;
+    let gate = { ...Promise.withResolvers(), entered: Promise.withResolvers() };
+    t.after(() => gate.resolve());
+    let hold = true, fail = false, reads = 0;
+    window.fetch = async (path, options) => {
+        if (path.endsWith('/usage')) {
+            reads++;
+            if (fail) throw new Error('Usage unavailable');
+            const response = await fetch(path, options);
+            if (hold && path.includes('/a/')) { gate.entered.resolve(); await gate.promise; }
+            return response;
+        }
+        return fetch(path, options);
+    };
+    const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
+    const poll = () => window.document.dispatchEvent(new window.Event('visibilitychange'));
+    select('a'); await gate.entered.promise;
+    await waitFor(() => $('status').textContent === '待機中');
+    $('draft').value = '取得中の指示'; $('draft').dispatchEvent(new window.Event('input')); $('draft').focus();
+    assert.equal($('send').disabled, false);
+    assert.equal($('usage').textContent, 'コンテキスト不明 · 週残り不明');
+    poll();
+    await waitFor(() => f.state.calls.filter(call => call.method === 'thread/queue/list').length >= 2);
+    assert.equal(reads, 1);
+    $('send').click(); await waitFor(() => $('draft').value === '');
+    assert.equal(f.state.queue.length, 1);
+    f.state.ansiScreen = codexScreen().replace('Context 5% used', 'Context 12% used · weekly 34% left');
+    select('b'); await waitFor(() => $('usage').textContent === 'コンテキスト12%使用 · 週残り34%');
+    select('a'); await waitFor(() => $('send-state').textContent.startsWith('待機中の指示'));
+    hold = false; gate.resolve();
+    await new Promise(setImmediate);
+    assert.equal($('usage').textContent, 'コンテキスト不明 · 週残り不明');
+    select(c.id); await waitFor(() => $('title').textContent === c.session.name);
+    await waitFor(() => $('status').textContent === '待機中');
+    assert.equal($('usage').hidden, true);
+    f.state.ansiScreen = codexScreen().replace('Context 5% used', 'Context 64% used · weekly 85% left');
+    select('a'); await waitFor(() => $('usage').textContent.includes('64%使用'));
+    $('draft').value = '保持する下書き'; $('draft').dispatchEvent(new window.Event('input')); $('draft').focus();
+    for (const failure of ['failState', 'failHerdr']) {
+        gate = { ...Promise.withResolvers(), entered: Promise.withResolvers() };
+        hold = true; poll(); await gate.entered.promise;
+        f.state[failure] = true;
+        await waitFor(() => $('send-state').textContent.startsWith('接続と会話の状態'));
+        f.state[failure] = false;
+        await waitFor(() => $('send-state').textContent.startsWith('待機中の指示'));
+        hold = false; gate.resolve(); await new Promise(setImmediate);
+        assert.equal($('usage').textContent, 'コンテキスト不明 · 週残り不明');
+        await waitFor(() => $('usage').textContent.includes('64%使用'));
+    }
+    fail = true; poll();
+    await waitFor(() => $('usage').textContent === 'コンテキスト不明 · 週残り不明');
+    assert.equal($('draft').value, '保持する下書き');
+    assert.equal(window.document.activeElement, $('draft'));
+    fail = false; poll(); await waitFor(() => $('usage').textContent.includes('64%使用'));
+    f.state.failHerdr = true; poll();
+    await waitFor(() => $('connection').classList.contains('error'));
+    assert.equal($('usage').textContent, 'コンテキスト不明 · 週残り不明');
+    f.state.failHerdr = false; poll();
+    await waitFor(() => $('usage').textContent.includes('64%使用'));
+    f.state.panes.shift(); poll();
+    await waitFor(() => $('status').textContent === '終了');
+    assert.equal($('usage').textContent, 'コンテキスト不明 · 週残り不明');
+});
+
 test('async questions arrive without focus changes and keep separate drafts through polling and recovery', async t => {
     const f = await fixture(); t.after(() => f.close());
     const { window, $ } = await mount(t, f);

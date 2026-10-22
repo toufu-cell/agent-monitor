@@ -36,7 +36,7 @@ function screenLines(ansi) {
     return lines;
 }
 
-export function codexInputState(ansi) {
+function codexInput(ansi) {
     const lines = screenLines(ansi);
     if (!lines) return 'unknown';
     const start = lines.findLastIndex(line => line[0]?.char === '›');
@@ -54,8 +54,27 @@ export function codexInputState(ansi) {
     if (!footer.length || footer.length > 3) return 'unknown';
     const content = lines.slice(start, end).flatMap((line, i) => i ? line : line.slice(1));
     if (!content.length || content.some(cell => cell.background !== background)) return 'unknown';
-    if (content.some(cell => cell.char !== ' ' && !cell.dim)) return 'draft';
-    return content.some(cell => cell.char !== ' ' && cell.dim) ? 'empty' : 'unknown';
+    if (content.some(cell => cell.char !== ' ' && !cell.dim)) return { state: 'draft', footer };
+    return { state: content.some(cell => cell.char !== ' ' && cell.dim) ? 'empty' : 'unknown', footer };
+}
+
+export function codexInputState(ansi) {
+    const input = codexInput(ansi);
+    return typeof input === 'string' ? input : input.state;
+}
+
+export function codexUsage(ansi) {
+    const input = codexInput(ansi);
+    const unknown = { contextUsedPercent: null, weeklyLeftPercent: null };
+    if (typeof input === 'string') return unknown;
+    const segments = input.footer.flatMap(line => line.map(cell => cell.char).join('').split(/[·│]/).map(text => text.trim()));
+    const percent = pattern => {
+        const matches = segments.map(text => pattern.exec(text)).filter(Boolean);
+        if (matches.length !== 1 || !/^\d+(?:\.\d+)?$/.test(matches[0][1])) return null;
+        const value = Number(matches[0][1]);
+        return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
+    };
+    return { contextUsedPercent: percent(/^Context (.+)% used$/i), weeklyLeftPercent: percent(/^weekly (.+)% left$/i) };
 }
 
 export function claudeInputState(ansi) {

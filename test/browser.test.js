@@ -99,6 +99,7 @@ test('mobile Claude list, conversation and shared input preserve PC multiline dr
     await page.screenshot({ path: 'artifacts/claude-mobile-list.png', fullPage: true });
     await page.locator('.thread-button').click();
     await page.getByRole('heading', { name: '確認結果' }).waitFor();
+    assert.equal(await page.locator('#usage').isHidden(), true);
     assert.equal(await page.locator('.message-role').last().textContent(), 'Claude Code');
     await page.screenshot({ path: 'artifacts/claude-mobile-conversation.png', fullPage: true });
     const text = 'スマホから複数行の指示\n2行目も送信';
@@ -129,6 +130,7 @@ test('mobile Claude list, conversation and shared input preserve PC multiline dr
 
 test('mobile reading, history prepending, new output, draft and terminal workflow', async t => {
     const f = await fixture(); t.after(() => f.close());
+    f.state.ansiScreen = codexScreen().replace('Context 5% used', 'Context 64% used · weekly 85% left');
     const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
     t.after(() => browser.close());
     const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
@@ -145,6 +147,10 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     await page.locator('.turn').first().waitFor();
     await page.waitForFunction(() => document.querySelectorAll('.turn').length === 20);
     await page.locator('#draft').fill('最初の下書き');
+    await page.getByText('コンテキスト64%使用 · 週残り85%', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'draft');
+    await page.screenshot({ path: 'artifacts/mobile-usage.png', fullPage: true });
     await page.locator('#draft').press('Enter');
     assert.equal(await page.locator('#draft').inputValue(), '最初の下書き\n');
     assert.equal(f.state.calls.filter(call => call.method === 'thread/queue/add').length, 0);
