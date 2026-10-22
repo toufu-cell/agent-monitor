@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
-import { HttpError, requireString } from './service.js';
+import { HttpError, requireString, MAX_IMAGE_BYTES } from './service.js';
 
 const STATIC = new Map([
     ['/', ['index.html', 'text/html; charset=utf-8']],
@@ -18,17 +18,23 @@ function authenticated(header, token) {
     return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-async function jsonBody(request) {
-    if (request.headers['content-type']?.split(';')[0].trim() !== 'application/json') throw new HttpError(415, 'JSON形式で送信してください。');
+async function boundedBody(request, limit) {
+    if (Number(request.headers['content-length']) > limit) throw new HttpError(413, '送信内容が上限を超えました。');
     const chunks = [];
     let length = 0;
-    for await (const chunk of request) {
+    for await (const chunk of request.iterator({ destroyOnReturn: false })) {
         length += chunk.length;
-        if (length > 128 * 1024) throw new HttpError(413, '送信内容が上限を超えました。');
+        if (length > limit) { request.resume(); throw new HttpError(413, '送信内容が上限を超えました。'); }
         chunks.push(chunk);
     }
+    return Buffer.concat(chunks);
+}
+
+async function jsonBody(request) {
+    if (request.headers['content-type']?.split(';')[0].trim() !== 'application/json') throw new HttpError(415, 'JSON形式で送信してください。');
+    const bytes = await boundedBody(request, 128 * 1024);
     let body;
-    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+    try { body = JSON.parse(bytes.toString('utf8')); }
     catch { throw new HttpError(400, 'JSONを読み取れません。'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, '送信内容を確認してください。');
     return body;
@@ -49,7 +55,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
         response.setHeader('Cache-Control', 'no-store');
         response.setHeader('X-Content-Type-Options', 'nosniff');
         response.setHeader('Referrer-Policy', 'no-referrer');
-        response.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; manifest-src 'self'; worker-src 'self'; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+        response.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; manifest-src 'self'; worker-src 'self'; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
         const json = (status, value) => {
             if (response.destroyed || response.writableEnded) return;
             response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -104,6 +110,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     }
                 }
                 if (request.method === 'POST' && resource === 'threads' && segments.length === 4) {
+                    if (action === 'images') return json(200, await service.uploadImage(id, await boundedBody(request, MAX_IMAGE_BYTES), request.headers['content-type']));
                     const body = await jsonBody(request);
                     if (action === 'send') return json(200, await service.send(id, body));
                     if (action === 'answer') return json(200, await service.answer(id, body));
@@ -125,7 +132,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
             json(error.status || 500, { error: error.status ? error.message : '要求を処理できません。接続を確認してください。' });
         }
     });
-    server.requestTimeout = 15000;
+    server.requestTimeout = 180000;
     server.headersTimeout = 10000;
     server.timeout = 30000;
     server.keepAliveTimeout = 5000;
