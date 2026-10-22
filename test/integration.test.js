@@ -113,7 +113,7 @@ test('images belong to a conversation and reach Codex queue or quoted CLI input 
     assert.equal(lost.body.state, 'failed'); assert.match(lost.body.message, /選び直して/);
 });
 
-test('image expiry removes real expired files and preserves renewed, in-flight and unknown images', async t => {
+test('image expiry preserves fresh sends and removes expired files including unknown outcomes', async t => {
     const f = await imageFixture(t);
     let now = Date.UTC(2026, 9, 22); f.service.now = () => now;
     const uploaded = (await f.upload()).body;
@@ -134,19 +134,20 @@ test('image expiry removes real expired files and preserves renewed, in-flight a
     const gate = { paneId: 'w1:p1', ...Promise.withResolvers(), entered: Promise.withResolvers() }; f.state.readGate = gate;
     const sending = f.request('/api/threads/a/send', { requestId: 'image_inflight_1234567890', text: '', imageId: renewed.imageId });
     await gate.entered.promise;
-    now += IMAGE_LIFETIME + 1;
     await f.upload(); assert.ok(await stat(path));
     gate.resolve(); assert.equal((await sending).body.state, 'succeeded');
-    await f.upload(); await assert.rejects(stat(path), { code: 'ENOENT' });
-    const unknown = (await f.upload()).body; const heldPath = f.service.images.get(unknown.imageId).path;
+    const unknown = (await f.upload()).body; const unknownPath = f.service.images.get(unknown.imageId).path;
+    now += IMAGE_LIFETIME - 1000;
     f.state.ignoreInput = true;
     const unknownBody = { requestId: 'image_unknown_1234567890', text: '', imageId: unknown.imageId };
     assert.equal((await f.request('/api/threads/a/send', unknownBody)).body.state, 'unknown');
     assert.equal((await f.request('/api/threads/a/send', unknownBody)).body.state, 'unknown');
-    now += IMAGE_LIFETIME + 1;
-    await f.upload(); assert.ok(await stat(heldPath));
+    assert.equal((await stat(unknownPath)).mtimeMs, now);
+    now += 2000;
+    await f.upload(); assert.ok(await stat(unknownPath));
+    now += IMAGE_LIFETIME - 2000;
+    await f.upload(); await assert.rejects(stat(unknownPath), { code: 'ENOENT' });
     f.service.images.clear();
-    await f.upload(); assert.ok(await stat(heldPath));
     const orphan = join(f.service.imageDir, '00000000-0000-4000-8000-000000000000.png');
     await writeFile(orphan, PNG); await utimes(orphan, new Date(now - IMAGE_LIFETIME), new Date(now - IMAGE_LIFETIME));
     await f.upload(); await assert.rejects(stat(orphan), { code: 'ENOENT' });

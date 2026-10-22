@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { realpath, stat, lstat, mkdir, chmod, open, readdir, unlink, utimes, writeFile } from 'node:fs/promises';
+import { realpath, stat, lstat, mkdir, chmod, open, readdir, unlink, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -206,7 +206,6 @@ export class MonitorService {
 
     async cleanImages(directory) {
         const names = await readdir(directory);
-        const held = new Set(names.filter(name => name.endsWith('.pending')).map(name => name.slice(0, 36)));
         for (const name of names) {
             if (!IMAGE_FILE.test(name)) continue;
             const path = join(directory, name);
@@ -214,7 +213,7 @@ export class MonitorService {
             let info;
             try { info = await lstat(path); }
             catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-            if (!info.isFile() || info.mtimeMs + IMAGE_LIFETIME > this.now() || held.has(name.slice(0, 36)) || image?.holds.size || image?.deleting) continue;
+            if (!info.isFile() || info.mtimeMs + IMAGE_LIFETIME > this.now() || image?.holds.size || image?.deleting) continue;
             if (image) image.deleting = true;
             try {
                 await unlink(path);
@@ -245,7 +244,7 @@ export class MonitorService {
         } finally { await file.close(); }
         const expiresAt = this.now() + IMAGE_LIFETIME;
         this.images.set(imageId, { threadId: id, path, expiresAt, holds: new Set() });
-        return { imageId, expiresAt };
+        return { imageId };
     }
 
     async prepareImage(id, imageId, requestId) {
@@ -260,8 +259,6 @@ export class MonitorService {
             const now = this.now();
             await utimes(image.path, new Date(now), new Date(now));
             image.expiresAt = now + IMAGE_LIFETIME;
-            // 応答が失われた画像は、再起動後も清掃から保護する。
-            await writeFile(`${image.path}.${requestId}.pending`, '', { flag: 'wx', mode: 0o600 });
             return image;
         } catch {
             image.holds.delete(requestId);
@@ -767,7 +764,6 @@ export class MonitorService {
         if (/[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]/.test(text)) throw new HttpError(400, '指示に制御文字が含まれています。');
         return this.once(body.requestId, JSON.stringify(['message', id, text, imageId]), async () => {
             const image = imageId ? await this.prepareImage(id, imageId, body.requestId) : null;
-            let unknown = false;
             try {
                 const sources = await this.sources();
                 const thread = await this.thread(id, sources);
@@ -795,14 +791,8 @@ export class MonitorService {
                     input: [{ type: 'text', text, textElements: [] }, ...(image ? [{ type: 'localImage', path: image.path }] : [])],
                 });
                 return image ? { submitted: true } : result;
-            } catch (error) {
-                unknown = Boolean(error.uncertain);
-                throw error;
             } finally {
-                if (image && !unknown) {
-                    image.holds.delete(body.requestId);
-                    await unlink(`${image.path}.${body.requestId}.pending`).catch(() => {});
-                }
+                if (image) image.holds.delete(body.requestId);
             }
         });
     }
