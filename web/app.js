@@ -889,10 +889,10 @@ $('image-file').addEventListener('change', () => {
     $('image-file').value = '';
     if (!selected || pending[selected] || !file) return;
     const cache = cacheFor(selected);
+    clearImage(selected);
     if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) cache.sendError = 'PNG、JPEG、WebP、GIFの画像を選んでください。';
     else if (!file.size || file.size > 10 * 1024 * 1024) cache.sendError = '画像は10MiB以下のファイルを選んでください。';
     else {
-        clearImage(selected);
         images.set(selected, { file, url: URL.createObjectURL(file), selectionId: requestId() });
         imageDrafts[selected] = true;
         cache.sendError = null;

@@ -153,15 +153,37 @@ test('image drafts survive selection, conversation switches, failures and unknow
     const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
     const file = (name = 'photo.png', type = 'image/png', bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64')) => new window.File([bytes], name, { type });
     const attach = image => {
-        Object.defineProperty($('image-file'), 'files', { value: [image], configurable: true });
+        Object.defineProperty($('image-file'), 'files', { value: image ? [image] : [], configurable: true });
         $('image-file').dispatchEvent(new window.Event('change'));
     };
     select('a'); await waitFor(() => $('send-state').textContent.includes('処理中のCodex'));
-    attach(file('bad.svg', 'image/svg+xml')); assert.match($('send-state').textContent, /PNG/);
-    attach(file('large.png', 'image/png', Buffer.alloc(10 * 1024 * 1024 + 1))); assert.match($('send-state').textContent, /10MiB/);
+    for (const [invalid, error] of [
+        [file('bad.svg', 'image/svg+xml'), /PNG/],
+        [file('large.png', 'image/png', Buffer.alloc(10 * 1024 * 1024 + 1)), /10MiB/],
+    ]) {
+        attach(file());
+        const previousURL = $('image-thumbnail').src;
+        attach();
+        assert.equal($('image-preview').hidden, false);
+        assert.equal($('image-thumbnail').src, previousURL);
+        assert.equal($('send').disabled, false);
+        assert.equal(revoked.includes(previousURL), false);
+        $('draft').value = '画像を確認'; $('draft').dispatchEvent(new window.Event('input'));
+        attach(invalid);
+        assert.match($('send-state').textContent, error);
+        assert.equal($('image-preview').hidden, true);
+        assert.equal($('image-thumbnail').hasAttribute('src'), false);
+        assert.equal($('image-name').textContent, '');
+        assert.ok(revoked.includes(previousURL));
+        assert.equal($('draft').value, '画像を確認');
+        assert.equal($('send').disabled, false);
+        $('draft').value = ''; $('draft').dispatchEvent(new window.Event('input'));
+        assert.equal($('send').disabled, true);
+    }
     attach(file()); assert.equal($('send').disabled, false); assert.equal(uploads, 0);
-    assert.equal($('image-thumbnail').src, 'blob:preview-1');
-    attach(file('replacement.png')); assert.deepEqual(revoked, ['blob:preview-1']);
+    const originalURL = $('image-thumbnail').src;
+    attach(file('replacement.png')); assert.ok(revoked.includes(originalURL));
+    const replacementURL = $('image-thumbnail').src;
     $('draft').value = '画像を確認'; $('draft').dispatchEvent(new window.Event('input'));
     select('b'); assert.equal($('image-preview').hidden, true);
     attach(file('other.png')); const otherURL = $('image-thumbnail').src;
@@ -186,7 +208,7 @@ test('image drafts survive selection, conversation switches, failures and unknow
     assert.equal(lookups, oldLookups);
     assert.equal($('image-thumbnail').src, otherURL);
     select('a'); await waitFor(() => $('image-preview').hidden);
-    assert.equal($('draft').value, ''); assert.ok(revoked.includes('blob:preview-2'));
+    assert.equal($('draft').value, ''); assert.ok(revoked.includes(replacementURL));
     attach(file('unknown.png')); await waitFor(() => !$('send').disabled);
     f.state.ignoreInput = true; $('send').click();
     await waitFor(() => !$('resolve').hidden);
