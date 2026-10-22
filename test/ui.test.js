@@ -100,7 +100,7 @@ async function mount(t, f, manualPolling = false, stored = {}, count = 2) {
 test('image upload deadlines allow slow transfers while ordinary API deadlines stay short', async t => {
     const f = await fixture(); t.after(() => f.close());
     const { window, $ } = await mount(t, f, true);
-    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDrsAAAAASUVORK5CYII=', 'base64');
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
     const deadlines = new WeakMap(), requests = [];
     window.AbortSignal = { timeout(milliseconds) {
         const signal = AbortSignal.timeout(milliseconds);
@@ -151,7 +151,7 @@ test('image drafts survive selection, conversation switches, failures and unknow
         return fetch(path, options);
     };
     const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
-    const file = (name = 'photo.png', type = 'image/png', bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDrsAAAAASUVORK5CYII=', 'base64')) => new window.File([bytes], name, { type });
+    const file = (name = 'photo.png', type = 'image/png', bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64')) => new window.File([bytes], name, { type });
     const attach = image => {
         Object.defineProperty($('image-file'), 'files', { value: [image], configurable: true });
         $('image-file').dispatchEvent(new window.Event('change'));
@@ -202,7 +202,7 @@ test('reloading an image submission permits reselection during upload and preser
         const f = await fixture(); t.after(() => f.close());
         assert.equal(dirname(f.service.imageDir), dirname(f.codexPath));
         const ui = await mount(t, f, true);
-        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDrsAAAAASUVORK5CYII=', 'base64');
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
         ui.window.URL.createObjectURL = () => 'blob:reload-preview';
         ui.window.URL.revokeObjectURL = () => {};
         const fetch = ui.window.fetch;

@@ -3,6 +3,7 @@ import { realpath, stat, lstat, mkdir, chmod, open, readdir, unlink, utimes } fr
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import sharp from 'sharp';
 import { isCodexTui, readPresence, originPort } from './presence.js';
 import { UpstreamError } from './rpc.js';
 import { codexInputState, claudeInputState, codexUsage } from './codex-input.js';
@@ -13,15 +14,73 @@ export class HttpError extends Error {
 }
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 64_000_000;
+const PNG_END = Buffer.from('0000000049454e44ae426082', 'hex');
 const IMAGE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
 const IMAGE_FILE = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.(png|jpg|webp|gif)$/;
 
-function imageExtension(bytes, contentType) {
+function pngChunksComplete(bytes) {
+    let offset = 8;
+    while (offset + 12 <= bytes.length) {
+        const length = bytes.readUInt32BE(offset);
+        const end = offset + length + 12;
+        if (end > bytes.length) return false;
+        if (bytes.toString('latin1', offset + 4, offset + 8) === 'IEND') {
+            return length === 0 && end === bytes.length && bytes.subarray(offset, end).equals(PNG_END);
+        }
+        offset = end;
+    }
+    return false;
+}
+
+function gifBlocksComplete(bytes) {
+    if (bytes.length < 13) return false;
+    const colorTableSize = packed => packed & 0x80 ? 3 * (2 << (packed & 7)) : 0;
+    let offset = 13 + colorTableSize(bytes[10]);
+    while (offset < bytes.length) {
+        const block = bytes[offset++];
+        if (block === 0x3b) return offset === bytes.length;
+        if (block === 0x21) {
+            if (offset >= bytes.length) return false;
+            offset++; // Extension label; the following size byte starts its sub-blocks.
+        } else if (block === 0x2c) {
+            if (offset + 9 > bytes.length) return false;
+            const packed = bytes[offset + 8];
+            offset += 9 + colorTableSize(packed);
+            if (offset >= bytes.length) return false;
+            offset++; // LZW minimum code size precedes the image data sub-blocks.
+        } else return false;
+        while (true) {
+            if (offset >= bytes.length) return false;
+            const length = bytes[offset++];
+            offset += length;
+            if (offset > bytes.length) return false;
+            if (length === 0) break;
+        }
+    }
+    return false;
+}
+
+async function imageExtension(bytes, contentType) {
     const type = contentType?.split(';')[0].trim();
-    if (type === 'image/png' && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'png';
-    if (type === 'image/jpeg' && bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'jpg';
-    if (type === 'image/webp' && bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'webp';
-    if (type === 'image/gif' && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))) return 'gif';
+    let extension;
+    if (type === 'image/png' && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) extension = 'png';
+    if (type === 'image/jpeg' && bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) extension = 'jpg';
+    if (type === 'image/webp' && bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') extension = 'webp';
+    if (type === 'image/gif' && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))) extension = 'gif';
+    if (extension) {
+        try {
+            const image = sharp(bytes, { animated: true, failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS });
+            const metadata = await image.metadata();
+            if (metadata.mediaType !== type) throw new Error('Image MIME mismatch');
+            if (extension === 'png' && !pngChunksComplete(bytes)) throw new Error('Incomplete PNG chunks');
+            if (extension === 'gif' && !gifBlocksComplete(bytes)) throw new Error('Incomplete GIF blocks');
+            await image.raw().toBuffer();
+            return extension;
+        } catch {
+            throw new HttpError(415, '画像の破損と、6,400万画素以下かを確認してください。GIFとWebPは全フレームの合計です。');
+        }
+    }
     throw new HttpError(415, 'PNG、JPEG、WebP、GIFの画像を選んでください。画像の形式も確認してください。');
 }
 
@@ -228,7 +287,7 @@ export class MonitorService {
     async uploadImage(id, bytes, contentType) {
         await this.thread(id);
         if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) throw new HttpError(413, '画像は10MiB以下のファイルを選んでください。');
-        const extension = imageExtension(bytes, contentType);
+        const extension = await imageExtension(bytes, contentType);
         const directory = await this.imageDirectory();
         await this.cleanImages(directory);
         const imageId = randomUUID();

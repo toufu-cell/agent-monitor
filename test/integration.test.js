@@ -7,11 +7,18 @@ import { mkdir, copyFile, appendFile, truncate, stat, rm, writeFile, mkdtemp, sy
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { crc32 } from 'node:zlib';
+import sharp from 'sharp';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { mergeTurns } from '../web/model.js';
 import { createMonitorServer } from '../src/server.js';
 
-const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDrsAAAAASUVORK5CYII=', 'base64');
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
+const JPEG = await sharp(Buffer.from(Array.from({ length: 32 * 32 * 3 }, (_, i) => (i * 31 + (i >> 3) * 7) % 256)), { raw: { width: 32, height: 32, channels: 3 } }).jpeg().toBuffer();
+const WEBP = await sharp(PNG).webp().toBuffer();
+const GIF = await sharp(PNG).gif().toBuffer();
+const IMAGE_FORMATS = [[PNG, 'image/png', 'png'], [JPEG, 'image/jpeg', 'jpg'], [WEBP, 'image/webp', 'webp'], [GIF, 'image/gif', 'gif']];
+const ANIMATIONS = await Promise.all(['gif', 'webp'].map(format => sharp(Buffer.from([198, 62, 56, 0, 128, 255]), { raw: { width: 1, height: 2, channels: 3, pageHeight: 1 } })[format]().toBuffer()));
 const IMAGE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
 
 async function imageFixture(t) {
@@ -29,7 +36,7 @@ async function imageFixture(t) {
     return f;
 }
 
-test('image upload validates HTTP identity, signatures and bounded bodies before private storage', async t => {
+test('image upload validates HTTP identity, formats and bounded bodies before private storage', async t => {
     const f = await imageFixture(t);
     for (const [headers, status] of [
         [{ Authorization: '' }, 401], [{ Origin: '' }, 403], [{ Origin: 'https://evil.example' }, 403],
@@ -52,11 +59,7 @@ test('image upload validates HTTP identity, signatures and bounded bodies before
         body: (async function* () { yield PNG; yield Buffer.alloc(10 * 1024 * 1024); })(), duplex: 'half',
     });
     assert.equal(streamed.status, 413); await streamed.json();
-    const formats = [
-        [PNG, 'image/png', 'png'], [Buffer.from([255, 216, 255, 224]), 'image/jpeg', 'jpg'],
-        [Buffer.from('RIFF0000WEBP'), 'image/webp', 'webp'], [Buffer.from('GIF89a'), 'image/gif', 'gif'],
-    ];
-    for (const [bytes, type, extension] of formats) {
+    for (const [bytes, type, extension] of IMAGE_FORMATS) {
         const result = await f.upload('a', bytes, type, { 'X-Filename': '../../original.png' });
         assert.equal(result.status, 200);
         assert.match(result.body.imageId, /^[a-f0-9-]{36}$/);
@@ -65,12 +68,83 @@ test('image upload validates HTTP identity, signatures and bounded bodies before
         assert.deepEqual(await readFile(path), bytes);
         assert.equal((await stat(path)).mode & 0o777, 0o600);
     }
-    const large = Buffer.alloc(10 * 1024 * 1024); PNG.copy(large);
+    const padding = Buffer.alloc(10 * 1024 * 1024 - PNG.length);
+    padding.writeUInt32BE(padding.length - 12); padding.write('paDd', 4);
+    padding.writeUInt32BE(crc32(padding.subarray(4, -4)), padding.length - 4);
+    const large = Buffer.concat([PNG.subarray(0, -12), padding, PNG.subarray(-12)]);
     assert.equal((await f.upload('a', large)).status, 200);
     assert.equal((await stat(f.service.imageDir)).mode & 0o777, 0o700);
     assert.equal((await readdir(f.service.imageDir)).length, 5);
     const page = await fetch(f.origin);
     assert.match(page.headers.get('content-security-policy'), /img-src 'self' blob:/);
+});
+
+test('image upload rejects incomplete and corrupt image data before storage or delivery', async t => {
+    const f = await imageFixture(t);
+    const corruptPNG = Buffer.from(PNG); corruptPNG[corruptPNG.indexOf('IDAT') + 4] ^= 255;
+    const scan = JPEG.indexOf(Buffer.from([255, 218]));
+    const corruptJPEG = Buffer.concat([JPEG.subarray(0, scan + 2 + JPEG.readUInt16BE(scan + 2) + 10), JPEG.subarray(-2)]);
+    const corruptWEBP = Buffer.from(WEBP); corruptWEBP.fill(255, 25);
+    const corruptGIF = Buffer.from(GIF); corruptGIF[corruptGIF.indexOf(44) + 10] = 13;
+    const cases = [
+        ['png', PNG, 8, 12, corruptPNG], ['jpeg', JPEG, 4, 2, corruptJPEG],
+        ['webp', WEBP, 12, 1, corruptWEBP], ['gif', GIF, 6, 1, corruptGIF],
+    ].flatMap(([format, bytes, header, ending, corrupt]) => [
+        [`${format} header`, bytes.subarray(0, header), `image/${format}`],
+        [`${format} missing ending`, bytes.subarray(0, -ending), `image/${format}`],
+        [`${format} incomplete pixels`, bytes.subarray(0, Math.floor(bytes.length * 0.75)), `image/${format}`],
+        [`${format} corrupt pixels`, corrupt, `image/${format}`],
+    ]);
+    const [gif, webp] = ANIMATIONS.map(bytes => Buffer.from(bytes));
+    const lastGIFFrame = gif.lastIndexOf(44); gif[lastGIFFrame + 10 + 6] = 13;
+    webp.fill(255, webp.lastIndexOf('VP8 ') + 12);
+    cases.push(['gif corrupt second frame', gif, 'image/gif'], ['webp corrupt second frame', webp, 'image/webp']);
+    const textData = Buffer.concat([Buffer.from('note\0before'), PNG.subarray(-12), Buffer.from('after')]);
+    const textChunk = Buffer.alloc(textData.length + 12);
+    textChunk.writeUInt32BE(textData.length); textChunk.write('tEXt', 4); textData.copy(textChunk, 8);
+    textChunk.writeUInt32BE(crc32(textChunk.subarray(4, -4)), textChunk.length - 4);
+    const pngWithText = Buffer.concat([PNG.subarray(0, -12), textChunk, PNG.subarray(-12)]);
+    const comment = Buffer.from('before;after');
+    const gifWithComment = Buffer.concat([GIF.subarray(0, -1), Buffer.from([0x21, 0xfe, comment.length]), comment, Buffer.from([0, 0x3b])]);
+    cases.push(
+        ['png truncated at embedded IEND', pngWithText.subarray(0, pngWithText.indexOf(PNG.subarray(-12)) + 12), 'image/png'],
+        ['gif truncated at embedded trailer', gifWithComment.subarray(0, gifWithComment.indexOf(0x3b, GIF.length - 1) + 1), 'image/gif'],
+    );
+    for (const [name, bytes, type] of cases) await t.test(name, async () => {
+        const result = await f.upload('a', bytes, type);
+        assert.equal(result.status, 415);
+        assert.equal(result.body.imageId, undefined);
+        assert.equal(f.service.images.size, 0);
+        assert.deepEqual(await readdir(f.service.imageDir).catch(error => { if (error.code === 'ENOENT') return []; throw error; }), []);
+    });
+});
+
+test('image validation reads every animation frame and bounds total decoded pixels', async t => {
+    const f = await imageFixture(t);
+    for (const [index, format] of ['gif', 'webp'].entries()) {
+        const result = await f.upload('a', ANIMATIONS[index], `image/${format}`);
+        assert.equal(result.status, 200);
+        assert.deepEqual(await readFile(f.service.images.get(result.body.imageId).path), ANIMATIONS[index]);
+    }
+    const photo = await sharp({ create: { width: 8000, height: 6000, channels: 3, background: '#c63e38' } }).png().toBuffer();
+    assert.equal((await f.upload('a', photo)).status, 200);
+    const frame = await sharp({ create: { width: 1000, height: 1000, channels: 3, background: '#c63e38' } }).gif().toBuffer();
+    const descriptor = frame.indexOf(44);
+    const animation = Buffer.concat([frame.subarray(0, descriptor), ...Array(65).fill(frame.subarray(descriptor, -1)), frame.subarray(-1)]);
+    const metadata = await sharp(animation, { animated: true }).metadata();
+    assert.equal(metadata.pages, 65);
+    assert.equal(metadata.width * metadata.height, 65000000);
+    assert.equal((await f.upload('a', animation, 'image/gif')).status, 415);
+    const webpFrames = await sharp(ANIMATIONS[1], { animated: true }).resize(1000, 1000).webp().toBuffer();
+    const firstFrame = webpFrames.indexOf('ANMF');
+    const webpAnimation = Buffer.concat([webpFrames.subarray(0, firstFrame), ...Array(33).fill(webpFrames.subarray(firstFrame))]);
+    webpAnimation.writeUInt32LE(webpAnimation.length - 8, 4);
+    const webpMetadata = await sharp(webpAnimation, { animated: true }).metadata();
+    assert.equal(webpMetadata.pages, 66);
+    assert.equal(webpMetadata.width * webpMetadata.height, 66000000);
+    assert.equal((await f.upload('a', webpAnimation, 'image/webp')).status, 415);
+    assert.equal((await readdir(f.service.imageDir)).length, 3);
+    assert.equal(f.service.images.size, 3);
 });
 
 test('images belong to a conversation and reach Codex queue or quoted CLI input without history data', async t => {
