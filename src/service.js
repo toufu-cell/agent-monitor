@@ -1,8 +1,9 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { realpath, stat } from 'node:fs/promises';
+import { realpath, stat, lstat, mkdir, chmod, open, readdir, unlink, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import sharp from 'sharp';
 import { isCodexTui, readPresence, originPort } from './presence.js';
 import { UpstreamError } from './rpc.js';
 import { codexInputState, claudeInputState, codexUsage } from './codex-input.js';
@@ -10,6 +11,77 @@ import { ClaudeReader, isClaudeProcess, claudeMatch, claudeThread } from './clau
 
 export class HttpError extends Error {
     constructor(status, message) { super(message); this.status = status; }
+}
+
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 64_000_000;
+const PNG_END = Buffer.from('0000000049454e44ae426082', 'hex');
+const IMAGE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
+const IMAGE_FILE = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.(png|jpg|webp|gif)$/;
+
+function pngChunksComplete(bytes) {
+    let offset = 8;
+    while (offset + 12 <= bytes.length) {
+        const length = bytes.readUInt32BE(offset);
+        const end = offset + length + 12;
+        if (end > bytes.length) return false;
+        if (bytes.toString('latin1', offset + 4, offset + 8) === 'IEND') {
+            return length === 0 && end === bytes.length && bytes.subarray(offset, end).equals(PNG_END);
+        }
+        offset = end;
+    }
+    return false;
+}
+
+function gifBlocksComplete(bytes) {
+    if (bytes.length < 13) return false;
+    const colorTableSize = packed => packed & 0x80 ? 3 * (2 << (packed & 7)) : 0;
+    let offset = 13 + colorTableSize(bytes[10]);
+    while (offset < bytes.length) {
+        const block = bytes[offset++];
+        if (block === 0x3b) return offset === bytes.length;
+        if (block === 0x21) {
+            if (offset >= bytes.length) return false;
+            offset++; // Extension label; the following size byte starts its sub-blocks.
+        } else if (block === 0x2c) {
+            if (offset + 9 > bytes.length) return false;
+            const packed = bytes[offset + 8];
+            offset += 9 + colorTableSize(packed);
+            if (offset >= bytes.length) return false;
+            offset++; // LZW minimum code size precedes the image data sub-blocks.
+        } else return false;
+        while (true) {
+            if (offset >= bytes.length) return false;
+            const length = bytes[offset++];
+            offset += length;
+            if (offset > bytes.length) return false;
+            if (length === 0) break;
+        }
+    }
+    return false;
+}
+
+async function imageExtension(bytes, contentType) {
+    const type = contentType?.split(';')[0].trim();
+    let extension;
+    if (type === 'image/png' && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) extension = 'png';
+    if (type === 'image/jpeg' && bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) extension = 'jpg';
+    if (type === 'image/webp' && bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') extension = 'webp';
+    if (type === 'image/gif' && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))) extension = 'gif';
+    if (extension) {
+        try {
+            const image = sharp(bytes, { animated: true, failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS });
+            const metadata = await image.metadata();
+            if (metadata.mediaType !== type) throw new Error('Image MIME mismatch');
+            if (extension === 'png' && !pngChunksComplete(bytes)) throw new Error('Incomplete PNG chunks');
+            if (extension === 'gif' && !gifBlocksComplete(bytes)) throw new Error('Incomplete GIF blocks');
+            await image.raw().toBuffer();
+            return extension;
+        } catch {
+            throw new HttpError(415, '画像の破損と、6,400万画素以下かを確認してください。GIFとWebPは全フレームの合計です。');
+        }
+    }
+    throw new HttpError(415, 'PNG、JPEG、WebP、GIFの画像を選んでください。画像の形式も確認してください。');
 }
 
 export function requireString(value, max = 200) {
@@ -85,7 +157,7 @@ function summary(thread, sources) {
 }
 
 function textContent(input = []) {
-    return input.map(part => part.type === 'text' ? part.text : `[${part.type}]`).join('\n');
+    return input.map(part => part.type === 'text' ? part.text : ['image', 'localImage'].includes(part.type) ? '[画像]' : `[${part.type}]`).join('\n');
 }
 
 const QUESTION_REPLY_OPEN = '<send_user_message_question_reply>';
@@ -165,7 +237,7 @@ function projectItem(item) {
 }
 
 export class MonitorService {
-    constructor(codex, herdr, presence = readPresence, claude = new ClaudeReader()) {
+    constructor(codex, herdr, presence = readPresence, claude = new ClaudeReader(), { imageDir = join(homedir(), '.local/share/agent-monitor/images'), now = Date.now } = {}) {
         this.codex = codex;
         this.herdr = herdr;
         this.presence = presence;
@@ -177,6 +249,80 @@ export class MonitorService {
         this.creationQueue = Promise.resolve();
         this.inputPanes = new Set();
         this.questionReservations = new Map();
+        this.imageDir = imageDir;
+        this.now = now;
+        this.images = new Map();
+    }
+
+    async imageDirectory() {
+        await mkdir(this.imageDir, { recursive: true, mode: 0o700 });
+        if (!(await lstat(this.imageDir)).isDirectory()) throw new HttpError(500, '画像の保存先を確認してください。');
+        await chmod(this.imageDir, 0o700);
+        const path = await realpath(this.imageDir);
+        if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(path)) throw new HttpError(500, '画像の保存先に制御文字を使用できません。');
+        return path;
+    }
+
+    async cleanImages(directory) {
+        const names = await readdir(directory);
+        for (const name of names) {
+            if (!IMAGE_FILE.test(name)) continue;
+            const path = join(directory, name);
+            const image = this.images.get(name.slice(0, 36));
+            let info;
+            try { info = await lstat(path); }
+            catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+            if (!info.isFile() || info.mtimeMs + IMAGE_LIFETIME > this.now() || image?.holds.size || image?.deleting) continue;
+            if (image) image.deleting = true;
+            try {
+                await unlink(path);
+                this.images.delete(name.slice(0, 36));
+            } catch (error) {
+                if (image) image.deleting = false;
+                if (error.code !== 'ENOENT') throw error;
+            }
+        }
+    }
+
+    async uploadImage(id, bytes, contentType) {
+        await this.thread(id);
+        if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) throw new HttpError(413, '画像は10MiB以下のファイルを選んでください。');
+        const extension = await imageExtension(bytes, contentType);
+        const directory = await this.imageDirectory();
+        await this.cleanImages(directory);
+        const imageId = randomUUID();
+        const path = join(directory, `${imageId}.${extension}`);
+        const file = await open(path, 'wx', 0o600);
+        try {
+            await file.chmod(0o600);
+            await file.writeFile(bytes);
+            await file.utimes(new Date(this.now()), new Date(this.now()));
+        } catch (error) {
+            await unlink(path).catch(() => {});
+            throw error;
+        } finally { await file.close(); }
+        const expiresAt = this.now() + IMAGE_LIFETIME;
+        this.images.set(imageId, { threadId: id, path, expiresAt, holds: new Set() });
+        return { imageId };
+    }
+
+    async prepareImage(id, imageId, requestId) {
+        const image = this.images.get(imageId);
+        if (!image || image.threadId !== id || image.deleting || image.expiresAt <= this.now()) {
+            throw new HttpError(410, '画像の有効期限または会話を確認できません。画像を選び直してください。');
+        }
+        image.holds.add(requestId);
+        try {
+            const info = await lstat(image.path);
+            if (!info.isFile() || !info.size || info.size > MAX_IMAGE_BYTES) throw new Error('Invalid image file');
+            const now = this.now();
+            await utimes(image.path, new Date(now), new Date(now));
+            image.expiresAt = now + IMAGE_LIFETIME;
+            return image;
+        } catch {
+            image.holds.delete(requestId);
+            throw new HttpError(410, '保存した画像を確認できません。画像を選び直してください。');
+        }
     }
 
     async pages(method, params = {}) {
@@ -672,33 +818,41 @@ export class MonitorService {
     }
 
     send(id, body) {
-        const text = requireString(body.text, 32000);
+        const imageId = body.imageId === undefined ? null : requireString(body.imageId, 36);
+        const text = imageId && typeof body.text === 'string' && !body.text.trim() && body.text.length <= 32000 ? body.text : requireString(body.text, 32000);
         if (/[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]/.test(text)) throw new HttpError(400, '指示に制御文字が含まれています。');
-        return this.once(body.requestId, JSON.stringify(['message', id, text]), async () => {
-            const sources = await this.sources();
-            const thread = await this.thread(id, sources);
-            const panes = sources.panes.filter(pane => pane.threadId === id);
-            this.assertMessageState(thread, panes);
-            if (thread.provider === 'claude' || thread.status.type === 'active') {
-                if (panes.length !== 1) throw new HttpError(409, '会話に対応する端末を1つに特定できません。端末で確認してください。');
-                if (/^[\/!]/.test(text.trimStart())) throw new HttpError(409, 'CLIコマンドは端末画面から入力してください。');
-                const identity = await this.identity(id, panes[0].pane_id, 'thread', sources);
-                return this.paneInput(identity.pane.pane_id, async () => {
-                    const { read } = await this.herdr.call('pane.read', { pane_id: identity.pane.pane_id, source: 'visible', format: 'ansi', strip_ansi: false });
-                    const input = (thread.provider === 'claude' ? claudeInputState : codexInputState)(read?.text);
-                    if (input !== 'empty') throw new HttpError(409, input === 'draft'
-                        ? 'PCの入力欄に下書きがあります。端末で確認してください。'
-                        : 'PCの入力欄を確認できません。端末で状態を確認してください。');
-                    await this.recheckMessageTarget(id, identity);
-                    return this.herdr.call('pane.send_input', { pane_id: identity.pane.pane_id, text: '\x1b[200~' + text + '\x1b[201~', keys: ['Enter'] });
+        return this.once(body.requestId, JSON.stringify(['message', id, text, imageId]), async () => {
+            const image = imageId ? await this.prepareImage(id, imageId, body.requestId) : null;
+            try {
+                const sources = await this.sources();
+                const thread = await this.thread(id, sources);
+                const panes = sources.panes.filter(pane => pane.threadId === id);
+                this.assertMessageState(thread, panes);
+                if (thread.provider === 'claude' || thread.status.type === 'active') {
+                    if (panes.length !== 1) throw new HttpError(409, '会話に対応する端末を1つに特定できません。端末で確認してください。');
+                    if (/^[\/!]/.test(text.trimStart())) throw new HttpError(409, 'CLIコマンドは端末画面から入力してください。');
+                    const identity = await this.identity(id, panes[0].pane_id, 'thread', sources);
+                    return await this.paneInput(identity.pane.pane_id, async () => {
+                        const { read } = await this.herdr.call('pane.read', { pane_id: identity.pane.pane_id, source: 'visible', format: 'ansi', strip_ansi: false });
+                        const input = (thread.provider === 'claude' ? claudeInputState : codexInputState)(read?.text);
+                        if (input !== 'empty') throw new HttpError(409, input === 'draft'
+                            ? 'PCの入力欄に下書きがあります。端末で確認してください。'
+                            : 'PCの入力欄を確認できません。端末で状態を確認してください。');
+                        await this.recheckMessageTarget(id, identity);
+                        const message = image ? `${text}${text ? '\n\n' : ''}添付画像を次の絶対パスから読み取ってください。\n画像: ${JSON.stringify(image.path)}` : text;
+                        return this.herdr.call('pane.send_input', { pane_id: identity.pane.pane_id, text: '\x1b[200~' + message + '\x1b[201~', keys: ['Enter'] });
+                    });
+                }
+                const queue = await this.pages('thread/queue/list', { threadId: id });
+                if (queue.length) throw new HttpError(409, '待機中の指示があります。処理が終わるまでお待ちください。');
+                const result = await this.codex.call('thread/queue/add', {
+                    threadId: id, clientUserMessageId: body.requestId,
+                    input: [{ type: 'text', text, textElements: [] }, ...(image ? [{ type: 'localImage', path: image.path }] : [])],
                 });
+                return image ? { submitted: true } : result;
+            } finally {
+                if (image) image.holds.delete(body.requestId);
             }
-            const queue = await this.pages('thread/queue/list', { threadId: id });
-            if (queue.length) throw new HttpError(409, '待機中の指示があります。処理が終わるまでお待ちください。');
-            return this.codex.call('thread/queue/add', {
-                threadId: id, clientUserMessageId: body.requestId,
-                input: [{ type: 'text', text, textElements: [] }],
-            });
         });
     }
 

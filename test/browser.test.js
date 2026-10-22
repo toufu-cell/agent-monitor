@@ -1,9 +1,58 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
+
+test('mobile image previews decode all supported formats and upload only on send', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.service.imageDir = await mkdtemp(join(tmpdir(), 'am-browser-images-'));
+    t.after(() => rm(f.service.imageDir, { recursive: true, force: true }));
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const errors = []; page.on('pageerror', error => errors.push(error.message));
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="a"]').click();
+    await page.waitForFunction(() => !document.getElementById('image-select').disabled);
+    const images = await page.evaluate(() => {
+        const canvas = document.createElement('canvas'); canvas.width = 160; canvas.height = 96;
+        const context = canvas.getContext('2d');
+        context.fillStyle = '#f4f6fa'; context.fillRect(0, 0, 160, 96);
+        context.fillStyle = '#c33b32'; context.fillRect(16, 16, 45, 45);
+        context.fillStyle = '#386e99'; context.beginPath(); context.arc(115, 39, 24, 0, Math.PI * 2); context.fill();
+        context.fillStyle = '#202c38'; context.font = '14px sans-serif'; context.fillText('IMAGE UPLOAD', 24, 83);
+        return ['image/png', 'image/jpeg', 'image/webp'].map(type => ({ type, base64: canvas.toDataURL(type).split(',')[1] }));
+    });
+    images.push({ type: 'image/gif', base64: 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7' });
+    for (const image of [...images, images[0]]) {
+        await page.locator('#image-file').setInputFiles({ name: `phone.${image.type.split('/')[1]}`, mimeType: image.type, buffer: Buffer.from(image.base64, 'base64') });
+        await page.locator('#image-thumbnail').evaluate(async element => { await element.decode(); if (!element.complete || !element.naturalWidth) throw new Error('Image preview did not load'); });
+        assert.equal(await page.locator('#image-thumbnail').evaluate(element => element.currentSrc.startsWith('blob:')), true);
+    }
+    assert.equal(f.service.images.size, 0);
+    assert.equal(await page.locator('#send').isDisabled(), false);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await mkdir('artifacts', { recursive: true });
+    await page.screenshot({ path: 'artifacts/mobile-image-upload.png', fullPage: true });
+    await page.locator('#send').click();
+    await page.locator('#image-preview').waitFor({ state: 'hidden' });
+    assert.equal(f.state.queue.length, 1);
+    assert.equal(f.state.queue[0].input[0].text, '');
+    assert.equal(f.state.queue[0].input[1].type, 'localImage');
+    assert.deepEqual(await readFile(f.state.queue[0].input[1].path), Buffer.from(images[0].base64, 'base64'));
+    await page.getByText('待機中の指示\n\n[画像]', { exact: true }).waitFor();
+    await page.locator('#image-file').setInputFiles({ name: 'reload.png', mimeType: 'image/png', buffer: Buffer.from(images[0].base64, 'base64') });
+    await page.reload();
+    await page.locator('.thread-button[data-thread-id="a"]').click();
+    await page.getByText('画像を選び直してください。ページの再読込みで画像の選択が解除されました。', { exact: true }).waitFor();
+    assert.equal(await page.locator('#image-thumbnail').isHidden(), true);
+    assert.equal(await page.locator('#send').isDisabled(), true);
+    assert.deepEqual(errors, []);
+});
 
 test('mobile notification worker receives and opens threads with a manifest and existing token links', async t => {
     const f = await notificationFixture(t, { tls: true });

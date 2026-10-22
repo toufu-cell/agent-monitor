@@ -38,21 +38,29 @@ const caches = new Map();
 const ranks = new Map();
 const drafts = getStored('drafts', {});
 const pending = getStored('pending', {});
+const imageDrafts = getStored('imageDrafts', {});
+const images = new Map();
 const questionDrafts = getStored('questionDrafts', {});
 const questionPending = getStored('questionPending', {});
 let pins;
 try { pins = new Set(JSON.parse(localStorage.getItem('pins') || '[]')); } catch { pins = new Set(); }
 const save = () => {
     sessionStorage.setItem('drafts', JSON.stringify(drafts)); sessionStorage.setItem('pending', JSON.stringify(pending));
+    sessionStorage.setItem('imageDrafts', JSON.stringify(imageDrafts));
     sessionStorage.setItem('questionDrafts', JSON.stringify(questionDrafts)); sessionStorage.setItem('questionPending', JSON.stringify(questionPending));
 };
+for (const [id, operation] of Object.entries(pending)) {
+    if (operation.phase === 'uploading') delete pending[id];
+}
+sessionStorage.setItem('pending', JSON.stringify(pending));
 
 async function api(path, body, keepalive = false) {
+    const image = body instanceof File;
     const response = await fetch(`/api/${path}`, {
         method: body === undefined ? 'GET' : 'POST',
-        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: keepalive ? undefined : AbortSignal.timeout(12000), keepalive,
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'Content-Type': image ? body.type : 'application/json' }) },
+        body: body === undefined ? undefined : image ? body : JSON.stringify(body),
+        signal: keepalive ? undefined : AbortSignal.timeout(image ? 180000 : 12000), keepalive,
     });
     const value = await response.json();
     if (!response.ok) throw Object.assign(new Error(value.error || '接続を確認してください。'), { status: response.status });
@@ -443,12 +451,23 @@ function renderComposer() {
     if (!selected) return;
     const cache = cacheFor(selected);
     const operation = pending[selected];
+    const image = images.get(selected);
+    const missingImage = imageDrafts[selected] && !image;
     $('status').textContent = cache.closed ? '終了' : stateLabel(cache.thread?.status);
     $('terminal-open').disabled = Boolean(cache.closed);
     const idle = cache.stateReady && cache.thread?.status.type === 'idle' && !cache.queue.length;
     const active = cache.stateReady && cache.thread?.status.type === 'active' && !cache.thread.status.activeFlags?.length;
-    $('send').disabled = (!idle && !active) || Boolean(operation) || !$('draft').value.trim();
-    $('send-state').textContent = operation ? (operation.state === 'unknown' ? '送信結果が不明です。PCで確認するまで再送できません。' : '送信結果を確認しています…')
+    $('send').disabled = (!idle && !active) || Boolean(operation) || Boolean(missingImage) || (!$('draft').value.trim() && !image);
+    $('image-select').disabled = Boolean(operation) || Boolean(cache.closed);
+    $('image-file').disabled = $('image-select').disabled;
+    $('image-remove').disabled = Boolean(operation);
+    $('image-preview').hidden = !image && !missingImage;
+    $('image-thumbnail').hidden = !image;
+    if (image && $('image-thumbnail').getAttribute('src') !== image.url) $('image-thumbnail').src = image.url;
+    if (!image) $('image-thumbnail').removeAttribute('src');
+    $('image-name').textContent = image ? image.file.name : missingImage ? '画像を選び直してください。ページの再読込みで画像の選択が解除されました。' : '';
+    $('send-state').textContent = operation ? (operation.state === 'unknown' ? '送信結果が不明です。PCで確認するまで再送できません。'
+        : operation.phase === 'uploading' ? '画像をアップロードしています…' : '送信結果を確認しています…')
         : cache.closed ? 'PCの会話は終了しました。下書きと履歴は保持されます。'
         : cache.sendError || (!cache.stateReady ? '接続と会話の状態を確認しています。下書きは保持されます。'
         : active ? `処理中の${providerName(cache.thread?.provider)}へ追加の指示を送ります。`
@@ -631,6 +650,8 @@ function settleOperation(id, result) {
     }
     if (result.state === 'succeeded') {
         if (drafts[id] === pending[id].text) drafts[id] = '';
+        if (operation.imageSelection && images.get(id)?.selectionId === operation.imageSelection) clearImage(id);
+        else if (operation.imageSelection && !images.has(id)) delete imageDrafts[id];
         delete pending[id];
         if (id === selected) $('draft').value = drafts[id] || '';
     } else if (result.state === 'failed') {
@@ -645,11 +666,24 @@ function settleOperation(id, result) {
 async function sendMessage() {
     if ($('send').disabled || !selected) return;
     const id = selected;
-    const operation = { requestId: requestId(), text: $('draft').value, state: 'processing' };
+    const image = images.get(id);
+    const operation = { requestId: requestId(), text: $('draft').value, state: 'processing', phase: image ? 'uploading' : 'sending', ...(image ? { imageSelection: image.selectionId } : {}) };
     cacheFor(id).sendError = null;
     drafts[id] = operation.text; pending[id] = operation; save(); renderComposer();
+    if (image) {
+        try {
+            const uploaded = await api(`threads/${encodeURIComponent(id)}/images`, image.file);
+            operation.imageId = uploaded.imageId;
+            operation.phase = 'sending';
+            save();
+            if (id === selected) renderComposer();
+        } catch (error) {
+            settleOperation(id, { requestId: operation.requestId, state: 'failed', message: error.message });
+            return;
+        }
+    }
     try { settleOperation(id, await api(`threads/${encodeURIComponent(id)}/send`, operation)); }
-    catch { settleOperation(id, { requestId: operation.requestId, state: 'unknown' }); }
+    catch (error) { settleOperation(id, { requestId: operation.requestId, state: error.status ? 'failed' : 'unknown', message: error.message }); }
     if (selected === id) await refreshSelected();
 }
 
@@ -678,6 +712,7 @@ async function poll() {
             }
         }
         for (const [id, operation] of Object.entries(pending)) {
+            if (operation.phase === 'uploading') continue;
             try { settleOperation(id, await api(`operations/${operation.requestId}`)); }
             catch { settleOperation(id, { requestId: operation.requestId, state: 'unknown' }); }
         }
@@ -842,6 +877,32 @@ $('launch-terminal').addEventListener('click', () => {
     openTerminal({ resource: 'launches', id: launchId });
 });
 $('draft').addEventListener('input', () => { if (selected) drafts[selected] = $('draft').value; save(); renderComposer(); });
+function clearImage(id) {
+    const image = images.get(id);
+    if (image) URL.revokeObjectURL(image.url);
+    images.delete(id);
+    delete imageDrafts[id];
+}
+$('image-select').addEventListener('click', () => $('image-file').click());
+$('image-file').addEventListener('change', () => {
+    const file = $('image-file').files[0];
+    $('image-file').value = '';
+    if (!selected || pending[selected] || !file) return;
+    const cache = cacheFor(selected);
+    clearImage(selected);
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) cache.sendError = 'PNG、JPEG、WebP、GIFの画像を選んでください。';
+    else if (!file.size || file.size > 10 * 1024 * 1024) cache.sendError = '画像は10MiB以下のファイルを選んでください。';
+    else {
+        images.set(selected, { file, url: URL.createObjectURL(file), selectionId: requestId() });
+        imageDrafts[selected] = true;
+        cache.sendError = null;
+    }
+    save(); renderComposer();
+});
+$('image-remove').addEventListener('click', () => {
+    if (!selected || pending[selected]) return;
+    clearImage(selected); cacheFor(selected).sendError = null; save(); renderComposer();
+});
 $('send').addEventListener('click', sendMessage);
 $('older').addEventListener('click', olderHistory);
 $('history').addEventListener('scroll', readingPosition);

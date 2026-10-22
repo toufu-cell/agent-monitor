@@ -3,13 +3,229 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
-import { mkdir, copyFile, appendFile, truncate, stat, rm, writeFile, mkdtemp, symlink } from 'node:fs/promises';
+import { mkdir, copyFile, appendFile, truncate, stat, rm, writeFile, mkdtemp, symlink, readFile, readdir, utimes } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { crc32 } from 'node:zlib';
+import sharp from 'sharp';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { mergeTurns } from '../web/model.js';
 import { createMonitorServer } from '../src/server.js';
+
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
+const JPEG = await sharp(Buffer.from(Array.from({ length: 32 * 32 * 3 }, (_, i) => (i * 31 + (i >> 3) * 7) % 256)), { raw: { width: 32, height: 32, channels: 3 } }).jpeg().toBuffer();
+const WEBP = await sharp(PNG).webp().toBuffer();
+const GIF = await sharp(PNG).gif().toBuffer();
+const IMAGE_FORMATS = [[PNG, 'image/png', 'png'], [JPEG, 'image/jpeg', 'jpg'], [WEBP, 'image/webp', 'webp'], [GIF, 'image/gif', 'gif']];
+const ANIMATIONS = await Promise.all(['gif', 'webp'].map(format => sharp(Buffer.from([198, 62, 56, 0, 128, 255]), { raw: { width: 1, height: 2, channels: 3, pageHeight: 1 } })[format]().toBuffer()));
+const IMAGE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
+
+async function imageFixture(t) {
+    const f = await fixture(); t.after(() => f.close());
+    const directory = await mkdtemp(join(tmpdir(), 'am-images-'));
+    f.service.imageDir = join(directory, 'private "images"');
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    await f.request('/api/threads');
+    f.upload = async (id = 'a', bytes = PNG, type = 'image/png', headers = {}) => {
+        const response = await fetch(`${f.origin}/api/threads/${encodeURIComponent(id)}/images`, {
+            method: 'POST', headers: { Authorization: `Bearer ${f.token}`, Origin: f.origin, 'Content-Type': type, ...headers }, body: bytes,
+        });
+        return { status: response.status, body: await response.json() };
+    };
+    return f;
+}
+
+test('image upload validates HTTP identity, formats and bounded bodies before private storage', async t => {
+    const f = await imageFixture(t);
+    for (const [headers, status] of [
+        [{ Authorization: '' }, 401], [{ Origin: '' }, 403], [{ Origin: 'https://evil.example' }, 403],
+    ]) assert.equal((await f.upload('a', PNG, 'image/png', headers)).status, status);
+    const badHost = await new Promise((resolve, reject) => {
+        const request = http.request(`${f.origin}/api/threads/a/images`, { method: 'POST', headers: { Host: 'evil.example', Origin: f.origin, Authorization: `Bearer ${f.token}`, 'Content-Type': 'image/png' } }, response => {
+            response.resume(); response.on('end', () => resolve(response.statusCode));
+        });
+        request.on('error', reject); request.end(PNG);
+    });
+    assert.equal(badHost, 403);
+    assert.equal((await f.upload('unknown')).status, 404);
+    for (const [bytes, type] of [[PNG, 'image/jpeg'], [Buffer.from('<svg/>'), 'image/svg+xml'], [Buffer.from('bad'), 'image/png']]) {
+        assert.equal((await f.upload('a', bytes, type)).status, 415);
+    }
+    assert.equal((await f.upload('a', Buffer.alloc(0))).status, 413);
+    assert.equal((await f.upload('a', Buffer.alloc(10 * 1024 * 1024 + 1))).status, 413);
+    const streamed = await fetch(`${f.origin}/api/threads/a/images`, {
+        method: 'POST', headers: { Authorization: `Bearer ${f.token}`, Origin: f.origin, 'Content-Type': 'image/png' },
+        body: (async function* () { yield PNG; yield Buffer.alloc(10 * 1024 * 1024); })(), duplex: 'half',
+    });
+    assert.equal(streamed.status, 413); await streamed.json();
+    for (const [bytes, type, extension] of IMAGE_FORMATS) {
+        const result = await f.upload('a', bytes, type, { 'X-Filename': '../../original.png' });
+        assert.equal(result.status, 200);
+        assert.match(result.body.imageId, /^[a-f0-9-]{36}$/);
+        const path = f.service.images.get(result.body.imageId).path;
+        assert.equal(path.endsWith(`/${result.body.imageId}.${extension}`), true);
+        assert.deepEqual(await readFile(path), bytes);
+        assert.equal((await stat(path)).mode & 0o777, 0o600);
+    }
+    const padding = Buffer.alloc(10 * 1024 * 1024 - PNG.length);
+    padding.writeUInt32BE(padding.length - 12); padding.write('paDd', 4);
+    padding.writeUInt32BE(crc32(padding.subarray(4, -4)), padding.length - 4);
+    const large = Buffer.concat([PNG.subarray(0, -12), padding, PNG.subarray(-12)]);
+    assert.equal((await f.upload('a', large)).status, 200);
+    assert.equal((await stat(f.service.imageDir)).mode & 0o777, 0o700);
+    assert.equal((await readdir(f.service.imageDir)).length, 5);
+    const page = await fetch(f.origin);
+    assert.match(page.headers.get('content-security-policy'), /img-src 'self' blob:/);
+});
+
+test('image upload rejects incomplete and corrupt image data before storage or delivery', async t => {
+    const f = await imageFixture(t);
+    const corruptPNG = Buffer.from(PNG); corruptPNG[corruptPNG.indexOf('IDAT') + 4] ^= 255;
+    const scan = JPEG.indexOf(Buffer.from([255, 218]));
+    const corruptJPEG = Buffer.concat([JPEG.subarray(0, scan + 2 + JPEG.readUInt16BE(scan + 2) + 10), JPEG.subarray(-2)]);
+    const corruptWEBP = Buffer.from(WEBP); corruptWEBP.fill(255, 25);
+    const corruptGIF = Buffer.from(GIF); corruptGIF[corruptGIF.indexOf(44) + 10] = 13;
+    const cases = [
+        ['png', PNG, 8, 12, corruptPNG], ['jpeg', JPEG, 4, 2, corruptJPEG],
+        ['webp', WEBP, 12, 1, corruptWEBP], ['gif', GIF, 6, 1, corruptGIF],
+    ].flatMap(([format, bytes, header, ending, corrupt]) => [
+        [`${format} header`, bytes.subarray(0, header), `image/${format}`],
+        [`${format} missing ending`, bytes.subarray(0, -ending), `image/${format}`],
+        [`${format} incomplete pixels`, bytes.subarray(0, Math.floor(bytes.length * 0.75)), `image/${format}`],
+        [`${format} corrupt pixels`, corrupt, `image/${format}`],
+    ]);
+    const [gif, webp] = ANIMATIONS.map(bytes => Buffer.from(bytes));
+    const lastGIFFrame = gif.lastIndexOf(44); gif[lastGIFFrame + 10 + 6] = 13;
+    webp.fill(255, webp.lastIndexOf('VP8 ') + 12);
+    cases.push(['gif corrupt second frame', gif, 'image/gif'], ['webp corrupt second frame', webp, 'image/webp']);
+    const textData = Buffer.concat([Buffer.from('note\0before'), PNG.subarray(-12), Buffer.from('after')]);
+    const textChunk = Buffer.alloc(textData.length + 12);
+    textChunk.writeUInt32BE(textData.length); textChunk.write('tEXt', 4); textData.copy(textChunk, 8);
+    textChunk.writeUInt32BE(crc32(textChunk.subarray(4, -4)), textChunk.length - 4);
+    const pngWithText = Buffer.concat([PNG.subarray(0, -12), textChunk, PNG.subarray(-12)]);
+    const comment = Buffer.from('before;after');
+    const gifWithComment = Buffer.concat([GIF.subarray(0, -1), Buffer.from([0x21, 0xfe, comment.length]), comment, Buffer.from([0, 0x3b])]);
+    cases.push(
+        ['png truncated at embedded IEND', pngWithText.subarray(0, pngWithText.indexOf(PNG.subarray(-12)) + 12), 'image/png'],
+        ['gif truncated at embedded trailer', gifWithComment.subarray(0, gifWithComment.indexOf(0x3b, GIF.length - 1) + 1), 'image/gif'],
+    );
+    for (const [name, bytes, type] of cases) await t.test(name, async () => {
+        const result = await f.upload('a', bytes, type);
+        assert.equal(result.status, 415);
+        assert.equal(result.body.imageId, undefined);
+        assert.equal(f.service.images.size, 0);
+        assert.deepEqual(await readdir(f.service.imageDir).catch(error => { if (error.code === 'ENOENT') return []; throw error; }), []);
+    });
+});
+
+test('image validation reads every animation frame and bounds total decoded pixels', async t => {
+    const f = await imageFixture(t);
+    for (const [index, format] of ['gif', 'webp'].entries()) {
+        const result = await f.upload('a', ANIMATIONS[index], `image/${format}`);
+        assert.equal(result.status, 200);
+        assert.deepEqual(await readFile(f.service.images.get(result.body.imageId).path), ANIMATIONS[index]);
+    }
+    const photo = await sharp({ create: { width: 8000, height: 6000, channels: 3, background: '#c63e38' } }).png().toBuffer();
+    assert.equal((await f.upload('a', photo)).status, 200);
+    const frame = await sharp({ create: { width: 1000, height: 1000, channels: 3, background: '#c63e38' } }).gif().toBuffer();
+    const descriptor = frame.indexOf(44);
+    const animation = Buffer.concat([frame.subarray(0, descriptor), ...Array(65).fill(frame.subarray(descriptor, -1)), frame.subarray(-1)]);
+    const metadata = await sharp(animation, { animated: true }).metadata();
+    assert.equal(metadata.pages, 65);
+    assert.equal(metadata.width * metadata.height, 65000000);
+    assert.equal((await f.upload('a', animation, 'image/gif')).status, 415);
+    const webpFrames = await sharp(ANIMATIONS[1], { animated: true }).resize(1000, 1000).webp().toBuffer();
+    const firstFrame = webpFrames.indexOf('ANMF');
+    const webpAnimation = Buffer.concat([webpFrames.subarray(0, firstFrame), ...Array(33).fill(webpFrames.subarray(firstFrame))]);
+    webpAnimation.writeUInt32LE(webpAnimation.length - 8, 4);
+    const webpMetadata = await sharp(webpAnimation, { animated: true }).metadata();
+    assert.equal(webpMetadata.pages, 66);
+    assert.equal(webpMetadata.width * webpMetadata.height, 66000000);
+    assert.equal((await f.upload('a', webpAnimation, 'image/webp')).status, 415);
+    assert.equal((await readdir(f.service.imageDir)).length, 3);
+    assert.equal(f.service.images.size, 3);
+});
+
+test('images belong to a conversation and reach Codex queue or quoted CLI input without history data', async t => {
+    const f = await imageFixture(t);
+    const uploaded = (await f.upload()).body;
+    const image = f.service.images.get(uploaded.imageId);
+    const body = { requestId: 'image_queue_1234567890', text: '', imageId: uploaded.imageId };
+    assert.equal((await f.request('/api/threads/b/send', { ...body, requestId: 'image_other_1234567890' })).body.state, 'failed');
+    assert.equal((await f.request('/api/threads/a/send', body)).body.state, 'succeeded');
+    assert.equal((await f.request('/api/threads/a/send', body)).body.state, 'succeeded');
+    assert.deepEqual(f.state.queue[0].input, [{ type: 'text', text: '', textElements: [] }, { type: 'localImage', path: image.path }]);
+    assert.equal(f.state.calls.filter(call => call.method === 'thread/queue/add').length, 1);
+    const second = (await f.upload()).body;
+    assert.equal((await f.request('/api/threads/a/send', { ...body, imageId: second.imageId })).status, 409);
+    f.state.queue[0].input = [{ type: 'image', imageUrl: 'data:image/png;base64,PRIVATE_IMAGE' }];
+    const queue = (await f.request('/api/threads/a/state')).body.queue;
+    assert.equal(queue[0].text, '[画像]'); assert.equal(JSON.stringify(queue).includes('PRIVATE_IMAGE'), false);
+    f.state.turns.get('a').at(-1).items[0].content.push({ type: 'image', imageUrl: 'data:image/png;base64,PRIVATE_IMAGE' });
+    const history = (await f.request('/api/threads/a/history')).body;
+    assert.match(JSON.stringify(history), /\[画像\]/); assert.equal(JSON.stringify(history).includes('PRIVATE_IMAGE'), false);
+    f.state.queue = [];
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] }; f.state.panes[0].agent_status = 'working';
+    const cliBody = { ...body, requestId: 'image_active_1234567890', text: '画像の色を確認' };
+    assert.equal((await f.request('/api/threads/a/send', cliBody)).body.state, 'succeeded');
+    const expected = `画像の色を確認\n\n添付画像を次の絶対パスから読み取ってください。\n画像: ${JSON.stringify(image.path)}`;
+    assert.deepEqual(f.state.writes.at(-1), { pane_id: 'w1:p1', text: '\x1b[200~' + expected + '\x1b[201~', keys: ['Enter'] });
+    for (const [index, text] of ['/exit', ' !ls', '\u001b[201~'].entries()) {
+        const result = await f.request('/api/threads/a/send', { ...cliBody, requestId: `image_cli_invalid_${index}_123456`, text });
+        assert.equal(result.status === 400 || result.body.state === 'failed', true);
+    }
+    assert.equal(f.state.writes.length, 1);
+    const c = await f.addClaude(); await f.request('/api/threads');
+    const claudeImage = (await f.upload(c.id)).body;
+    assert.equal((await f.request(`/api/threads/${c.id}/send`, { requestId: 'image_claude_1234567890', text: '', imageId: claudeImage.imageId })).body.state, 'succeeded');
+    assert.equal(f.state.writes.at(-1).pane_id, c.pane.pane_id);
+    assert.match(f.state.writes.at(-1).text, /添付画像/);
+    assert.equal(JSON.parse(f.state.writes.at(-1).text.split('画像: ')[1].slice(0, -6)), f.service.images.get(claudeImage.imageId).path);
+    f.service.images.clear();
+    const lost = await f.request('/api/threads/a/send', { ...body, requestId: 'image_lost_1234567890' });
+    assert.equal(lost.body.state, 'failed'); assert.match(lost.body.message, /選び直して/);
+});
+
+test('image expiry preserves fresh sends and removes expired files including unknown outcomes', async t => {
+    const f = await imageFixture(t);
+    let now = Date.UTC(2026, 9, 22); f.service.now = () => now;
+    const uploaded = (await f.upload()).body;
+    const expired = f.service.images.get(uploaded.imageId).path;
+    const unrelated = join(f.service.imageDir, 'keep.txt'); await writeFile(unrelated, 'keep');
+    now += IMAGE_LIFETIME;
+    const rejected = await f.request('/api/threads/a/send', { requestId: 'image_expired_1234567890', text: '', imageId: uploaded.imageId });
+    assert.equal(rejected.body.state, 'failed'); assert.match(rejected.body.message, /選び直して/);
+    await f.upload();
+    await assert.rejects(stat(expired), { code: 'ENOENT' }); assert.equal(await readFile(unrelated, 'utf8'), 'keep');
+    const renewed = (await f.upload()).body; const path = f.service.images.get(renewed.imageId).path;
+    now += IMAGE_LIFETIME - 1000;
+    assert.equal((await f.request('/api/threads/a/send', { requestId: 'image_renew_1234567890', text: '', imageId: renewed.imageId })).body.state, 'succeeded');
+    assert.equal((await stat(path)).mtimeMs, now);
+    now += 2000; await f.upload(); assert.ok(await stat(path));
+    f.state.queue = [];
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] }; f.state.panes[0].agent_status = 'working';
+    const gate = { paneId: 'w1:p1', ...Promise.withResolvers(), entered: Promise.withResolvers() }; f.state.readGate = gate;
+    const sending = f.request('/api/threads/a/send', { requestId: 'image_inflight_1234567890', text: '', imageId: renewed.imageId });
+    await gate.entered.promise;
+    await f.upload(); assert.ok(await stat(path));
+    gate.resolve(); assert.equal((await sending).body.state, 'succeeded');
+    const unknown = (await f.upload()).body; const unknownPath = f.service.images.get(unknown.imageId).path;
+    now += IMAGE_LIFETIME - 1000;
+    f.state.ignoreInput = true;
+    const unknownBody = { requestId: 'image_unknown_1234567890', text: '', imageId: unknown.imageId };
+    assert.equal((await f.request('/api/threads/a/send', unknownBody)).body.state, 'unknown');
+    assert.equal((await f.request('/api/threads/a/send', unknownBody)).body.state, 'unknown');
+    assert.equal((await stat(unknownPath)).mtimeMs, now);
+    now += 2000;
+    await f.upload(); assert.ok(await stat(unknownPath));
+    now += IMAGE_LIFETIME - 2000;
+    await f.upload(); await assert.rejects(stat(unknownPath), { code: 'ENOENT' });
+    f.service.images.clear();
+    const orphan = join(f.service.imageDir, '00000000-0000-4000-8000-000000000000.png');
+    await writeFile(orphan, PNG); await utimes(orphan, new Date(now - IMAGE_LIFETIME), new Date(now - IMAGE_LIFETIME));
+    await f.upload(); await assert.rejects(stat(orphan), { code: 'ENOENT' });
+});
 
 test('usage HTTP reads only the verified Codex footer and validates percentages and target identity', async t => {
     const f = await fixture(); t.after(() => f.close());

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { JSDOM } from 'jsdom';
 import { fixture, codexScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
@@ -95,6 +96,177 @@ async function mount(t, f, manualPolling = false, stored = {}, count = 2) {
     await waitFor(() => $('connection').textContent.includes(`${count}件`));
     return { window, $ };
 }
+
+test('image upload deadlines allow slow transfers while ordinary API deadlines stay short', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { window, $ } = await mount(t, f, true);
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
+    const deadlines = new WeakMap(), requests = [];
+    window.AbortSignal = { timeout(milliseconds) {
+        const signal = AbortSignal.timeout(milliseconds);
+        deadlines.set(signal, milliseconds);
+        return signal;
+    } };
+    window.URL.createObjectURL = () => 'blob:upload-deadline';
+    window.URL.revokeObjectURL = () => {};
+    const fetch = window.fetch;
+    window.fetch = (path, options) => {
+        requests.push({ path, timeout: deadlines.get(options.signal) });
+        return fetch(path, options.body instanceof window.File ? { ...options, body: png } : options);
+    };
+    window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+    await waitFor(() => $('send-state').textContent.includes('待機中のPC'));
+    Object.defineProperty($('image-file'), 'files', { value: [new window.File([png], 'slow.png', { type: 'image/png' })] });
+    $('image-file').dispatchEvent(new window.Event('change'));
+    $('send').click();
+    await waitFor(() => $('queue').textContent.includes('[画像]'));
+    assert.deepEqual({
+        upload: requests.filter(request => request.path.endsWith('/images')).map(request => request.timeout),
+        ordinary: [...new Set(requests.filter(request => !request.path.endsWith('/images')).map(request => request.timeout))],
+        bodyReception: f.server.requestTimeout, headers: f.server.headersTimeout, idle: f.server.timeout,
+    }, { upload: [180000], ordinary: [12000], bodyReception: 180000, headers: 10000, idle: 30000 });
+});
+
+test('image drafts survive selection, conversation switches, failures and unknown delivery', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] }; f.state.panes[0].agent_status = 'working';
+    const { window, $ } = await mount(t, f, true);
+    const revoked = []; let urls = 0, uploads = 0, lookups = 0, stateRefreshes = 0;
+    window.URL.createObjectURL = () => `blob:preview-${++urls}`;
+    window.URL.revokeObjectURL = url => revoked.push(url);
+    const fetch = window.fetch;
+    let uploadGate = null, failUpload = false;
+    window.fetch = async (path, options) => {
+        if (path.includes('/operations/')) lookups++;
+        if (path.endsWith('/state')) stateRefreshes++;
+        if (path.endsWith('/images')) {
+            uploads++;
+            if (uploadGate) await uploadGate.promise;
+            if (failUpload) throw new Error('Upload disconnected');
+            const bytes = await new Promise((resolve, reject) => {
+                const reader = new window.FileReader(); reader.onload = () => resolve(Buffer.from(reader.result)); reader.onerror = reject; reader.readAsArrayBuffer(options.body);
+            });
+            return fetch(path, { ...options, body: bytes });
+        }
+        return fetch(path, options);
+    };
+    const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
+    const file = (name = 'photo.png', type = 'image/png', bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64')) => new window.File([bytes], name, { type });
+    const attach = image => {
+        Object.defineProperty($('image-file'), 'files', { value: image ? [image] : [], configurable: true });
+        $('image-file').dispatchEvent(new window.Event('change'));
+    };
+    select('a'); await waitFor(() => $('send-state').textContent.includes('処理中のCodex'));
+    for (const [invalid, error] of [
+        [file('bad.svg', 'image/svg+xml'), /PNG/],
+        [file('large.png', 'image/png', Buffer.alloc(10 * 1024 * 1024 + 1)), /10MiB/],
+    ]) {
+        attach(file());
+        const previousURL = $('image-thumbnail').src;
+        attach();
+        assert.equal($('image-preview').hidden, false);
+        assert.equal($('image-thumbnail').src, previousURL);
+        assert.equal($('send').disabled, false);
+        assert.equal(revoked.includes(previousURL), false);
+        $('draft').value = '画像を確認'; $('draft').dispatchEvent(new window.Event('input'));
+        attach(invalid);
+        assert.match($('send-state').textContent, error);
+        assert.equal($('image-preview').hidden, true);
+        assert.equal($('image-thumbnail').hasAttribute('src'), false);
+        assert.equal($('image-name').textContent, '');
+        assert.ok(revoked.includes(previousURL));
+        assert.equal($('draft').value, '画像を確認');
+        assert.equal($('send').disabled, false);
+        $('draft').value = ''; $('draft').dispatchEvent(new window.Event('input'));
+        assert.equal($('send').disabled, true);
+    }
+    attach(file()); assert.equal($('send').disabled, false); assert.equal(uploads, 0);
+    const originalURL = $('image-thumbnail').src;
+    attach(file('replacement.png')); assert.ok(revoked.includes(originalURL));
+    const replacementURL = $('image-thumbnail').src;
+    $('draft').value = '画像を確認'; $('draft').dispatchEvent(new window.Event('input'));
+    select('b'); assert.equal($('image-preview').hidden, true);
+    attach(file('other.png')); const otherURL = $('image-thumbnail').src;
+    select('a'); await waitFor(() => !$('send').disabled);
+    assert.equal($('image-name').textContent, 'replacement.png'); assert.equal($('draft').value, '画像を確認');
+    failUpload = true; $('send').click();
+    await waitFor(() => $('send-state').textContent.includes('Upload disconnected'));
+    assert.equal($('draft').value, '画像を確認'); assert.equal($('image-preview').hidden, false); assert.equal($('send').disabled, false);
+    failUpload = false; f.state.ansiScreen = codexScreen('PCの下書き', false); $('send').click();
+    await waitFor(() => $('send-state').textContent.includes('下書きがあります'));
+    assert.equal($('draft').value, '画像を確認'); assert.equal($('image-name').textContent, 'replacement.png');
+    f.state.ansiScreen = codexScreen(); uploadGate = Promise.withResolvers(); $('send').click();
+    assert.equal($('image-file').disabled, true); assert.equal($('image-remove').disabled, true); assert.equal($('image-select').disabled, true);
+    const oldLookups = lookups;
+    const oldRefreshes = stateRefreshes;
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => stateRefreshes > oldRefreshes);
+    select('b'); assert.equal($('image-thumbnail').src, otherURL);
+    uploadGate.resolve(); uploadGate = null;
+    await waitFor(() => f.state.writes.length === 1);
+    await waitFor(() => !JSON.parse(window.sessionStorage.getItem('pending')).a);
+    assert.equal(lookups, oldLookups);
+    assert.equal($('image-thumbnail').src, otherURL);
+    select('a'); await waitFor(() => $('image-preview').hidden);
+    assert.equal($('draft').value, ''); assert.ok(revoked.includes(replacementURL));
+    attach(file('unknown.png')); await waitFor(() => !$('send').disabled);
+    f.state.ignoreInput = true; $('send').click();
+    await waitFor(() => !$('resolve').hidden);
+    assert.equal($('send').disabled, true); assert.equal($('image-remove').disabled, true);
+    assert.equal($('image-name').textContent, 'unknown.png');
+    const writes = f.state.writes.length; $('send').click(); assert.equal(f.state.writes.length, writes);
+    $('resolve').click(); assert.equal($('image-remove').disabled, false);
+    $('image-remove').click(); assert.equal($('image-preview').hidden, true); assert.equal($('send').disabled, true);
+});
+
+test('reloading an image submission permits reselection during upload and preserves uncertainty after send', async t => {
+    for (const stage of ['uploading', 'sending']) await t.test(stage, async t => {
+        const f = await fixture(); t.after(() => f.close());
+        assert.equal(dirname(f.service.imageDir), dirname(f.codexPath));
+        const ui = await mount(t, f, true);
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
+        ui.window.URL.createObjectURL = () => 'blob:reload-preview';
+        ui.window.URL.revokeObjectURL = () => {};
+        const fetch = ui.window.fetch;
+        const gate = Promise.withResolvers();
+        let paused = false;
+        ui.window.fetch = async (path, options) => {
+            if (path.endsWith(stage === 'uploading' ? '/images' : '/send')) {
+                paused = true;
+                await gate.promise;
+            }
+            return fetch(path, options?.body instanceof ui.window.File ? { ...options, body: png } : options);
+        };
+        ui.window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+        await waitFor(() => ui.$('send-state').textContent.includes('待機中のPC'));
+        ui.$('draft').value = '再読込み後も保持する指示'; ui.$('draft').dispatchEvent(new ui.window.Event('input'));
+        Object.defineProperty(ui.$('image-file'), 'files', { value: [new ui.window.File([png], 'reload.png', { type: 'image/png' })] });
+        ui.$('image-file').dispatchEvent(new ui.window.Event('change'));
+        ui.$('send').click(); await waitFor(() => paused);
+        const stored = Object.fromEntries(['drafts', 'pending', 'imageDrafts'].map(key => [key, ui.window.sessionStorage.getItem(key)]));
+        const operation = JSON.parse(stored.pending).a;
+        assert.equal(f.service.operations.has(operation.requestId), false);
+        const reloaded = await mount(t, f, true, stored);
+        reloaded.window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+        await waitFor(() => reloaded.$('send-state').textContent.includes(stage === 'uploading' ? '待機中のPC' : '送信結果が不明'));
+        assert.equal(reloaded.$('draft').value, '再読込み後も保持する指示');
+        assert.match(reloaded.$('image-name').textContent, /選び直して/);
+        assert.equal(reloaded.$('send').disabled, true);
+        assert.equal(reloaded.$('resolve').hidden, stage === 'uploading');
+        assert.equal(reloaded.$('image-select').disabled, stage === 'sending');
+        if (stage === 'uploading') {
+            assert.equal(JSON.parse(reloaded.window.sessionStorage.getItem('pending')).a, undefined);
+            reloaded.$('image-remove').click();
+            assert.equal(reloaded.$('send').disabled, false);
+        } else {
+            assert.equal(JSON.parse(reloaded.window.sessionStorage.getItem('pending')).a.requestId, operation.requestId);
+            reloaded.$('resolve').click();
+            assert.equal(reloaded.$('image-select').disabled, false);
+        }
+        gate.reject(new Error('Page reloaded'));
+        await waitFor(() => !JSON.parse(ui.window.sessionStorage.getItem('pending')).a || !ui.$('resolve').hidden);
+    });
+});
 
 test('usage polling stays independent of sending and rejects stale selections and failed connections', async t => {
     const f = await fixture(); t.after(() => f.close());
@@ -469,6 +641,7 @@ test('launch UI prevents repeat requests, recovers by ID and hands off after tru
     held.release();
     await waitFor(() => held.consumed);
     const stored = Object.fromEntries(['launchRequestId', 'drafts', 'pending'].map(key => [key, window.sessionStorage.getItem(key)]));
+    await waitFor(() => $('usage').textContent.includes('コンテキスト5%使用'));
     window.close();
     ({ window, $ } = await mount(t, f, true, stored));
     const tick = () => window.document.dispatchEvent(new window.Event('visibilitychange'));

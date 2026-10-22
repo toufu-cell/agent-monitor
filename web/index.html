@@ -42,8 +42,14 @@
             <p id="send-state" role="status">会話を選ぶと指示を入力できます。</p>
             <button id="composer-terminal" hidden>端末を開く</button>
             <button id="resolve" hidden>PCで結果を確認して下書きを解除</button>
+            <div id="image-preview" hidden>
+                <img id="image-thumbnail" alt="送信する画像のプレビュー" hidden>
+                <span id="image-name"></span>
+                <button id="image-remove" type="button">画像を削除</button>
+            </div>
             <textarea id="draft" rows="3" maxlength="32000" aria-label="次の指示" placeholder="次の指示を書く" disabled></textarea>
-            <div class="composer-actions"><span>Enterで改行</span><button id="send" disabled>指示を送信</button></div>
+            <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="送信する画像" hidden disabled>
+            <div class="composer-actions"><button id="image-select" type="button" disabled>画像を選択</button><span>Enterで改行</span><button id="send" disabled>指示を送信</button></div>
             <p id="usage" hidden></p>
         </section>
     </main>

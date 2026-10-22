@@ -226,7 +226,7 @@ export async function fixture({ now = Date.now } = {}) {
     const service = new MonitorService(codex, new HerdrClient(herdrPath, 1000), async pids => {
         if (state.failPresence) throw new Error('OS resource read failed');
         return new Map(pids.filter(pid => state.resources.has(pid)).map(pid => [pid, state.resources.get(pid)]));
-    }, claude);
+    }, claude, { imageDir: join(dir, 'images') });
     const server = createMonitorServer({ service, token, origin });
     await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
     const request = async (path, body, overrides = {}) => {
