@@ -8,6 +8,7 @@ import { isCodexTui, readPresence, originPort } from './presence.js';
 import { UpstreamError } from './rpc.js';
 import { codexInputState, claudeInputState, codexUsage } from './codex-input.js';
 import { ClaudeReader, isClaudeProcess, claudeMatch, claudeThread } from './claude.js';
+import { readChanges } from './changes.js';
 
 export class HttpError extends Error {
     constructor(status, message) { super(message); this.status = status; }
@@ -449,6 +450,11 @@ export class MonitorService {
         const current = summary(thread, sources);
         this.known.set(id, current);
         return current;
+    }
+
+    async changes(id, path) {
+        const thread = await this.thread(id);
+        return readChanges(thread.cwd, path);
     }
 
     async usage(id) {

@@ -92,6 +92,10 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     if (resource === 'launches' && segments.length === 3) return json(200, await service.launchStatus(id));
                     if (resource === 'launches' && action === 'terminal' && segments.length === 4) return json(200, await service.terminal(id, requireString(url.searchParams.get('bindingId')), 'launch'));
                     if (resource === 'threads' && segments.length === 4) {
+                        if (action === 'changes') {
+                            if (url.searchParams.getAll('path').length > 1) throw new HttpError(400, 'ファイルは1つずつ選んでください。');
+                            return json(200, await service.changes(id, url.searchParams.get('path')));
+                        }
                         if (action === 'state') return json(200, await service.questionState(id));
                         if (action === 'usage') return json(200, await service.usage(id));
                         if (action === 'history') return json(200, await service.history(id, url.searchParams.get('cursor'), url.searchParams.get('until')));

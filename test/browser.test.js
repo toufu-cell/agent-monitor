@@ -1,11 +1,67 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
+
+test('mobile changes reads real Git diffs with usable headers at narrow widths', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await mkdtemp(join(tmpdir(), 'am-browser-changes-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const git = (...args) => promisify(execFile)('git', ['-C', root, ...args], {
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    });
+    const path = `src/${'長いファイル名'.repeat(8)}.ts`;
+    await mkdir(join(root, 'src'));
+    await writeFile(join(root, path), 'export const message = "Before";\n');
+    await git('init', '-q'); await git('add', '.');
+    await git('-c', 'user.name=Browser Test', '-c', 'user.email=browser@example.test', 'commit', '-qm', 'initial');
+    await writeFile(join(root, path), 'export const message = "<img src=x onerror=alert(1)>";\nexport const ready = true;\n');
+    await writeFile(join(root, 'new.txt'), 'スマホで新しいファイルを確認します。\n');
+    f.state.threads.get('a').cwd = join(root, 'src');
+    f.state.threads.get('a').name = '長い会話タイトルでも変更と端末の操作を使えることを確認する';
+    f.state.threads.get('b').cwd = tmpdir();
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const errors = []; page.on('pageerror', error => errors.push(error.message));
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="a"]').click();
+    await mkdir('artifacts', { recursive: true });
+    for (const width of [390, 320]) {
+        await page.setViewportSize({ width, height: 844 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        const controls = await page.locator('.conversation-header').evaluate(header => [...header.children].filter(child => child.getBoundingClientRect().width).map(child => {
+            const box = child.getBoundingClientRect(); return { id: child.id || child.className, x: box.x, right: box.right, width: box.width };
+        }));
+        assert.ok(controls.every(control => control.x >= 0 && control.right <= width && control.width > 0), JSON.stringify(controls));
+        await page.screenshot({ path: `artifacts/mobile-changes-header-${width}.png`, fullPage: true });
+        await page.locator('#changes-open').click();
+        await page.locator('#changes-file').selectOption(path);
+        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('+export const ready = true;'));
+        assert.equal(await page.locator('#changes-diff img').count(), 0);
+        assert.equal(await page.locator('#changes-dialog').evaluate(dialog => dialog.scrollWidth <= dialog.clientWidth), true);
+        for (const id of ['changes-file', 'changes-refresh', 'changes-close']) {
+            const box = await page.locator(`#${id}`).boundingBox();
+            assert.ok(box.x >= 0 && box.x + box.width <= width && box.height >= 44, id);
+        }
+        await page.screenshot({ path: `artifacts/mobile-changes-diff-${width}.png`, fullPage: true });
+        await page.locator('#changes-file').selectOption('new.txt');
+        await page.getByText('HEADから現在の作業ツリーへの差分です。', { exact: true }).waitFor();
+        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('+スマホで新しいファイルを確認します。'));
+        await page.locator('#changes-close').click();
+    }
+    await page.locator('#back').click(); await page.locator('.thread-button[data-thread-id="b"]').click();
+    await page.locator('#changes-open').click();
+    await page.getByText('この会話の作業ディレクトリはGit管理外です。', { exact: true }).waitFor();
+    assert.equal(await page.locator('#changes-file').isDisabled(), true);
+    assert.deepEqual(errors, []);
+});
 
 test('mobile image previews decode all supported formats and upload only on send', async t => {
     const f = await fixture(); t.after(() => f.close());

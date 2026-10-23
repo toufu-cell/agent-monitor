@@ -29,6 +29,7 @@ let terminalBusy = false;
 let terminalRequest = 0;
 let terminalResultRequestId = null;
 let terminalOwner = null;
+let changesRequest = 0;
 let launchId = sessionStorage.getItem('launchRequestId') || null;
 let launchState = launchId ? { requestId: launchId, state: 'waiting' } : null;
 let launchBusy = false;
@@ -179,6 +180,7 @@ function renderLaunch() {
 
 function openLaunch() {
     closeTerminal({ returnToLaunch: false });
+    closeChanges();
     renderLaunch();
     if (!$('launch-dialog').open) $('launch-dialog').showModal();
     refreshLaunch();
@@ -326,6 +328,7 @@ async function selectThread(id) {
         return;
     }
     closeTerminal({ returnToLaunch: false });
+    closeChanges();
     rememberConversation();
     selected = id; generation++;
     save();
@@ -337,6 +340,7 @@ async function selectThread(id) {
     $('title').textContent = thread.title; $('project').textContent = thread.cwd;
     $('draft').value = drafts[id] || ''; $('draft').disabled = false;
     $('terminal-open').disabled = false;
+    $('changes-open').disabled = false;
     $('turns').replaceChildren();
     $('questions').replaceChildren();
     document.body.classList.add('reading');
@@ -455,6 +459,7 @@ function renderComposer() {
     const missingImage = imageDrafts[selected] && !image;
     $('status').textContent = cache.closed ? '終了' : stateLabel(cache.thread?.status);
     $('terminal-open').disabled = Boolean(cache.closed);
+    $('changes-open').disabled = Boolean(cache.closed);
     const idle = cache.stateReady && cache.thread?.status.type === 'idle' && !cache.queue.length;
     const active = cache.stateReady && cache.thread?.status.type === 'active' && !cache.thread.status.activeFlags?.length;
     $('send').disabled = (!idle && !active) || Boolean(operation) || Boolean(missingImage) || (!$('draft').value.trim() && !image);
@@ -705,6 +710,7 @@ async function poll() {
             cache.closed = !threads.some(thread => thread.id === selected);
             if (cache.closed) {
                 generation++;
+                closeChanges();
                 cache.usage = null;
                 cache.stateReady = false;
                 if (terminalOwner?.resource === 'threads') closeTerminal();
@@ -724,6 +730,7 @@ async function poll() {
         refreshUsage();
         await refreshSelected();
     } catch (error) {
+        closeChanges();
         $('connection').textContent = `接続を確認してください。${error.message}`; $('connection').classList.add('error');
         if (selected) { cacheFor(selected).usageRequest = null; cacheFor(selected).usage = null; cacheFor(selected).stateReady = false; renderComposer(); }
     } finally { polling = false; }
@@ -865,6 +872,84 @@ async function terminalInput(key) {
     }
 }
 
+function closeChanges() {
+    changesRequest++;
+    if ($('changes-dialog').open) $('changes-dialog').close();
+}
+
+function currentChanges(request, id, captured) {
+    return changesRequest === request && $('changes-dialog').open && currentSelection(selected, generation, id, captured);
+}
+
+async function loadChangesFile() {
+    const path = $('changes-file').value;
+    const id = selected, captured = generation, request = ++changesRequest;
+    $('changes-path').textContent = path;
+    $('changes-diff').textContent = '';
+    $('changes-diff').hidden = true;
+    $('changes-detail').textContent = path ? '差分を読み込んでいます…' : '';
+    $('changes-detail').classList.remove('error');
+    if (!path) return;
+    try {
+        const result = await api(`threads/${encodeURIComponent(id)}/changes?path=${encodeURIComponent(path)}`);
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-detail').textContent = result.message || 'HEADから現在の作業ツリーへの差分です。';
+        $('changes-diff').textContent = result.diff || '';
+        $('changes-diff').hidden = !result.diff;
+        $('changes-diff').scrollTop = 0;
+        $('changes-diff').scrollLeft = 0;
+    } catch (error) {
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-detail').textContent = error.message;
+        $('changes-detail').classList.add('error');
+    }
+}
+
+async function loadChanges() {
+    if (!selected) return;
+    const id = selected, captured = generation, request = ++changesRequest;
+    const previous = $('changes-file').value;
+    $('changes-file').replaceChildren();
+    $('changes-file').disabled = true;
+    $('changes-root').textContent = '';
+    $('changes-path').textContent = '';
+    $('changes-detail').textContent = '';
+    $('changes-diff').textContent = '';
+    $('changes-diff').hidden = true;
+    $('changes-state').textContent = '変更ファイルを読み込んでいます…';
+    $('changes-state').classList.remove('error');
+    try {
+        const result = await api(`threads/${encodeURIComponent(id)}/changes`);
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-root').textContent = result.root || '';
+        const files = result.files || [];
+        $('changes-state').textContent = result.message || (files.length ? `${files.length}件 · ファイルを選ぶと差分を表示します。` : '作業ツリーに変更はありません。');
+        for (const file of files) {
+            const label = file.status === '??' ? '未追跡' : file.status.includes('U') ? '競合' : file.status.includes('D') ? '削除' : file.status.includes('A') ? '追加' : '変更';
+            const option = node('option', `${label} · ${file.path}`); option.value = file.path;
+            $('changes-file').append(option);
+        }
+        $('changes-file').disabled = !files.length;
+        if (files.some(file => file.path === previous)) $('changes-file').value = previous;
+        if (files.length) await loadChangesFile();
+    } catch (error) {
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-state').textContent = error.message;
+        $('changes-state').classList.add('error');
+    }
+}
+
+$('changes-open').addEventListener('click', () => {
+    if (!selected || cacheFor(selected).closed) return;
+    $('changes-dialog').showModal();
+    loadChanges();
+});
+$('changes-close').addEventListener('click', closeChanges);
+$('changes-dialog').addEventListener('cancel', event => { event.preventDefault(); closeChanges(); });
+$('changes-dialog').addEventListener('close', () => { if (!$('changes-dialog').open) changesRequest++; });
+$('changes-refresh').addEventListener('click', loadChanges);
+$('changes-file').addEventListener('change', loadChangesFile);
+
 $('search').addEventListener('input', renderList);
 $('launch-open').addEventListener('click', openLaunch);
 $('launch-form').addEventListener('submit', startLaunch);
@@ -907,7 +992,7 @@ $('send').addEventListener('click', sendMessage);
 $('older').addEventListener('click', olderHistory);
 $('history').addEventListener('scroll', readingPosition);
 $('latest').addEventListener('click', () => { $('history').scrollTop = $('history').scrollHeight; readingPosition(); });
-$('back').addEventListener('click', () => { rememberConversation(); closeTerminal(); document.body.classList.remove('reading'); });
+$('back').addEventListener('click', () => { rememberConversation(); closeTerminal(); closeChanges(); document.body.classList.remove('reading'); });
 $('resolve').addEventListener('click', () => {
     if (window.confirm('PCで送信結果を確認しましたか？下書きを解除すると、新しい操作として送信できるようになります。')) {
         delete pending[selected]; save(); renderComposer();

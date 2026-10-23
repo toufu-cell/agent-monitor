@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import net from 'node:net';
-import { mkdir, copyFile, appendFile, truncate, stat, rm, writeFile, mkdtemp, symlink, readFile, readdir, utimes } from 'node:fs/promises';
+import { mkdir, copyFile, appendFile, truncate, stat, rm, writeFile, mkdtemp, symlink, readFile, readdir, utimes, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,125 @@ import sharp from 'sharp';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { mergeTurns } from '../web/model.js';
 import { createMonitorServer } from '../src/server.js';
+
+async function changesFixture(t) {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await mkdtemp(join(tmpdir(), 'am-changes-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const git = (...args) => promisify(execFile)('git', ['-C', root, ...args], {
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    });
+    await git('init', '-q');
+    await git('config', 'user.name', 'Changes Test'); await git('config', 'user.email', 'changes@example.test');
+    await mkdir(join(root, 'sub'));
+    f.state.threads.get('a').cwd = join(root, 'sub');
+    await f.request('/api/threads');
+    return { ...f, root, git, detail: path => f.request(`/api/threads/a/changes?path=${encodeURIComponent(path)}`) };
+}
+
+test('changes HTTP reads HEAD to worktree across staged, unstaged and literal repo paths', async t => {
+    const f = await changesFixture(t);
+    const names = ['tracked.txt', 'deleted.txt', 'literal[1].txt', 'literal1.txt', ':(glob)*.txt', '-leading.txt'];
+    for (const name of names) await writeFile(join(f.root, name), `before ${name}\n`);
+    await f.git('add', '.'); await f.git('commit', '-qm', 'initial');
+    await writeFile(join(f.root, 'tracked.txt'), 'only staged\n'); await f.git('add', 'tracked.txt');
+    await writeFile(join(f.root, 'tracked.txt'), 'current worktree\n');
+    await rm(join(f.root, 'deleted.txt'));
+    for (const name of names.slice(2)) await writeFile(join(f.root, name), `current ${name}\n`);
+    const html = '<img src=x onerror=alert(1)>\n';
+    await writeFile(join(f.root, 'untracked.html'), html);
+    const list = await f.request('/api/threads/a/changes');
+    assert.equal(list.status, 200); assert.equal(list.body.root, await realpath(f.root));
+    assert.deepEqual(list.body.files.map(file => file.path).sort(), [...names, 'untracked.html'].sort());
+    const changed = await f.detail('tracked.txt');
+    assert.equal(changed.status, 200); assert.match(changed.body.diff, /-before tracked.txt\n\+current worktree/);
+    assert.doesNotMatch(changed.body.diff, /only staged/);
+    assert.match((await f.detail('deleted.txt')).body.diff, /-before deleted.txt/);
+    for (const name of names.slice(2)) {
+        const diff = (await f.detail(name)).body.diff;
+        assert.equal(diff.split('\n').filter(line => line.startsWith('+current ')).join('\n'), `+current ${name}`);
+    }
+    assert.match((await f.detail('untracked.html')).body.diff, /\+<img src=x onerror=alert\(1\)>/);
+    assert.equal((await f.detail('tracked.txt')).body.diff.includes('untracked.html'), false);
+});
+
+test('changes HTTP reads HEAD deletions when a parent directory becomes a file', async t => {
+    const f = await changesFixture(t);
+    const paths = ['dir/old.txt', 'dir/nested/old.txt'];
+    await mkdir(join(f.root, 'dir/nested'), { recursive: true });
+    for (const path of paths) await writeFile(join(f.root, path), `removed ${path}\n`);
+    await f.git('add', '.'); await f.git('commit', '-qm', 'initial');
+    await rm(join(f.root, 'dir'), { recursive: true });
+    await writeFile(join(f.root, 'dir'), 'replacement file\n');
+    const list = await f.request('/api/threads/a/changes');
+    assert.equal(list.status, 200);
+    for (const path of paths) {
+        assert.ok(list.body.files.some(file => file.path === path && file.status.includes('D')));
+        const detail = await f.detail(path);
+        assert.equal(detail.status, 200);
+        assert.ok(detail.body.diff.includes(`-removed ${path}\n`));
+        assert.match(detail.body.diff, /\+\+\+ \/dev\/null\n/);
+        assert.equal(detail.body.diff.includes('replacement file'), false);
+    }
+    await rm(join(f.root, 'dir'));
+    await symlink(join(f.root, 'sub'), join(f.root, 'dir'));
+    for (const path of paths) assert.equal((await f.detail(path)).body.reason, 'symlink');
+});
+
+test('changes HTTP handles unborn HEAD and reports unsupported content without running repository programs', async t => {
+    const f = await changesFixture(t);
+    await writeFile(join(f.root, 'staged.txt'), 'first staged content\n');
+    await f.git('add', 'staged.txt');
+    const staged = await f.detail('staged.txt');
+    assert.equal(staged.status, 200); assert.match(staged.body.diff, /^--- \/dev\/null\n/);
+    assert.match(staged.body.diff, /\+first staged content/);
+    await f.git('commit', '-qm', 'initial');
+    const sentinel = join(f.root, 'program-ran');
+    const command = `touch '${sentinel}'`;
+    for (const [key, value] of [
+        ['filter.tripwire.clean', command], ['filter.tripwire.process', command], ['filter.tripwire.required', 'true'],
+        ['diff.tripwire.textconv', command], ['diff.external', command], ['core.fsmonitor', command], ['core.pager', command],
+    ]) await f.git('config', key, value);
+    await writeFile(join(f.root, '.gitattributes'), '*.txt filter=tripwire diff=tripwire\n');
+    await writeFile(join(f.root, 'staged.txt'), 'safe current content\n');
+    await writeFile(join(f.root, 'binary.bin'), Buffer.from([0, 1, 2]));
+    await writeFile(join(f.root, 'legacy.txt'), Buffer.from([255, 254, 97]));
+    await writeFile(join(f.root, 'large.txt'), Buffer.alloc(256 * 1024 + 1, 97));
+    await symlink(join(f.root, 'staged.txt'), join(f.root, 'linked.txt'));
+    assert.match((await f.detail('staged.txt')).body.diff, /\+safe current content/);
+    for (const [path, reason] of [['binary.bin', 'binary'], ['legacy.txt', 'binary'], ['large.txt', 'large'], ['linked.txt', 'symlink']]) {
+        const result = await f.detail(path);
+        assert.equal(result.status, 200); assert.equal(result.body.reason, reason); assert.equal(result.body.diff, undefined);
+        assert.ok(result.body.message);
+    }
+    assert.equal((await readdir(f.root)).includes('program-ran'), false);
+});
+
+test('changes HTTP validates identity, current conversations, stale paths, limits and Git availability', async t => {
+    const f = await changesFixture(t);
+    for (const path of ['/api/threads/a/changes', '/api/threads/a/changes?path=file.txt']) {
+        assert.equal((await f.request(path, undefined, { Authorization: '' })).status, 401);
+    }
+    assert.equal((await f.request('/api/threads/unknown/changes')).status, 404);
+    assert.equal((await f.request('/api/threads/a/changes')).body.files.length, 0);
+    for (const path of ['', '../secret', '/etc/passwd', 'sub/../file', '\0', 'x'.repeat(4097)]) {
+        assert.equal((await f.detail(path)).status, 400);
+    }
+    assert.equal((await f.request('/api/threads/a/changes?path=a&path=b')).status, 400);
+    await writeFile(join(f.root, 'gone.txt'), 'temporary\n');
+    assert.equal((await f.detail('gone.txt')).status, 200);
+    await rm(join(f.root, 'gone.txt'));
+    assert.equal((await f.detail('gone.txt')).status, 409);
+    await Promise.all(Array.from({ length: 501 }, (_, i) => writeFile(join(f.root, `file-${i}.txt`), 'new\n')));
+    const capped = await f.request('/api/threads/a/changes');
+    assert.equal(capped.body.files.length, 500); assert.equal(capped.body.limited, true); assert.ok(capped.body.message);
+    const outside = await mkdtemp(join(tmpdir(), 'am-not-git-'));
+    t.after(() => rm(outside, { recursive: true, force: true }));
+    f.state.threads.get('a').cwd = outside;
+    assert.equal((await f.request('/api/threads/a/changes')).body.state, 'notGit');
+    f.state.process.foreground_processes = [{ pid: 100, name: 'zsh', argv: ['zsh'] }];
+    assert.equal((await f.request('/api/threads/a/changes')).status, 409);
+});
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVQImWM4ZmdxzM6CAUIBACTWBPHkwkg6AAAAAElFTkSuQmCC', 'base64');
 const JPEG = await sharp(Buffer.from(Array.from({ length: 32 * 32 * 3 }, (_, i) => (i * 31 + (i >> 3) * 7) % 256)), { raw: { width: 32, height: 32, channels: 3 } }).jpeg().toBuffer();
