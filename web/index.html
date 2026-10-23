@@ -37,6 +37,15 @@
             <div id="turns"></div>
         </section>
         <section id="questions" aria-label="Codexからの質問" hidden></section>
+        <section id="approval-card" aria-label="承認待ちの端末" hidden>
+            <p id="approval-state" class="notice" role="status"></p>
+            <pre id="approval-screen" tabindex="0" aria-label="承認待ちの端末表示"></pre>
+            <div class="approval-actions">
+                <button id="approval-enter" disabled>選択中の項目にEnter</button>
+                <button id="approval-refresh" disabled>更新</button>
+                <button id="approval-terminal">端末を開く</button>
+            </div>
+        </section>
         <section id="composer" aria-label="指示の入力">
             <div id="queue" aria-label="待機中の指示"></div>
             <p id="send-state" role="status">会話を選ぶと指示を入力できます。</p>

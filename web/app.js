@@ -29,6 +29,11 @@ let terminalBusy = false;
 let terminalRequest = 0;
 let terminalResultRequestId = null;
 let terminalOwner = null;
+let terminalSurface = null;
+let approvalChecking = false;
+let approvalAttempt = null;
+let approvalRetryAt = 0;
+let approvalExpiry = null;
 let launchId = sessionStorage.getItem('launchRequestId') || null;
 let launchState = launchId ? { requestId: launchId, state: 'waiting' } : null;
 let launchBusy = false;
@@ -474,10 +479,11 @@ function renderComposer() {
         : cache.queue.length ? '待機中の指示があります。処理が終わると送信できます。'
         : idle ? '待機中のPCの会話へ送信します。' : `${stateLabel(cache.thread?.status)}です。端末で状態を確認できます。`);
     $('resolve').hidden = operation?.state !== 'unknown';
-    $('composer-terminal').hidden = cache.closed || !cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+    renderTerminalButtons();
     $('queue').replaceChildren(...cache.queue.map(item => node('p', `待機中の指示\n${item.text}`)));
     renderQuestions();
     renderUsage();
+    syncApproval();
 }
 
 function questionKey(id, question) { return JSON.stringify([id, question.turnId, question.itemId, question.index]); }
@@ -642,10 +648,14 @@ function settleOperation(id, result) {
     if (id === 'terminal') {
         if (['succeeded', 'failed'].includes(result.state)) delete pending.terminal;
         else operation.state = result.state;
+        if (result.state === 'failed' && terminalSurface === 'card' && terminalBinding?.bindingId === operation.bindingId) {
+            terminalBinding.inputError = `端末への送信に失敗しました。${result.message || ''}`;
+            terminalView = null;
+        }
         showTerminalResult(operation, result);
         if (result.state === 'succeeded' && terminalResultRequestId === result.requestId && $('terminal-text').value === operation.text) $('terminal-text').value = '';
         save(); terminalControls();
-        if (['succeeded', 'failed'].includes(result.state) && terminalBinding?.bindingId === operation.bindingId && !terminalBusy) refreshTerminal();
+        if (['succeeded', 'failed'].includes(result.state) && terminalBinding?.bindingId === operation.bindingId && !terminalBusy && terminalSurface === 'dialog') refreshTerminal();
         return;
     }
     if (result.state === 'succeeded') {
@@ -729,6 +739,60 @@ async function poll() {
     } finally { polling = false; }
 }
 
+function approvalEligible() {
+    const cache = selected && cacheFor(selected);
+    return cache?.stateReady && !cache.closed && cache.thread?.provider === 'codex'
+        && cache.thread.status.type === 'active' && cache.thread.status.activeFlags?.includes('waitingOnApproval')
+        && conversationVisible() && !document.hidden && !$('launch-dialog').open && !$('terminal-dialog').open;
+}
+
+function renderTerminalButtons() {
+    const card = !$('approval-card').hidden, cache = selected && cacheFor(selected);
+    $('conversation').classList.toggle('approval-visible', card);
+    $('send-state').hidden = card && !pending[selected] && !cache?.sendError;
+    $('terminal-open').hidden = card;
+    $('composer-terminal').hidden = card || !cache || cache.closed || !cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+}
+
+function hideApproval() {
+    $('approval-card').hidden = true;
+    if (terminalSurface === 'card') { invalidateTerminal(); terminalOwner = null; terminalSurface = null; }
+    $('approval-state').textContent = '';
+    renderTerminalButtons();
+}
+
+async function syncApproval() {
+    if (!approvalEligible()) { approvalAttempt = null; approvalRetryAt = 0; hideApproval(); return; }
+    if (approvalChecking || Date.now() < approvalRetryAt) return;
+    const id = selected, captured = generation, request = terminalRequest;
+    approvalChecking = true;
+    try {
+        const { panes } = await api(`threads/${encodeURIComponent(id)}/panes`);
+        if (id !== selected || captured !== generation || request !== terminalRequest || !approvalEligible()) return;
+        const matched = panes.filter(pane => pane.session === id);
+        if (matched.length !== 1) { approvalAttempt = null; hideApproval(); return; }
+        const paneId = matched[0].id, attempt = JSON.stringify([id, paneId, matched[0].terminalId, matched[0].workspace]);
+        if (terminalSurface === 'card' && terminalBinding?.approvalPaneKey === attempt) { terminalControls(); return; }
+        hideApproval();
+        if (approvalAttempt === attempt) return;
+        approvalAttempt = attempt;
+        terminalSurface = 'card'; terminalOwner = { resource: 'threads', id };
+        const bindingRequest = terminalRequest;
+        terminalBusy = true;
+        const binding = await api(`${terminalPath()}/bind`, { paneId });
+        if (!currentTerminal(bindingRequest, paneId) || binding.paneId !== paneId) {
+            releaseBinding({ ...binding, resource: 'threads', id }); return;
+        }
+        terminalBinding = { ...binding, resource: 'threads', id, approvalPaneKey: attempt };
+        terminalBusy = false;
+        await refreshTerminal();
+    } catch {
+        if (id === selected && captured === generation && terminalSurface !== 'dialog') {
+            approvalAttempt = null; approvalRetryAt = Date.now() + 2000; hideApproval();
+        }
+    } finally { approvalChecking = false; }
+}
+
 function terminalControls() {
     const bound = terminalBinding && $('terminal-dialog').open && terminalBinding.paneId === $('pane-select').value;
     const ready = bound && terminalView && !terminalBusy && !pending.terminal;
@@ -736,10 +800,25 @@ function terminalControls() {
     $('terminal-refresh').disabled = !bound || terminalBusy;
     $('keys').querySelectorAll('button').forEach(button => { button.disabled = !ready; });
     $('terminal-resolve').hidden = pending.terminal?.state !== 'unknown';
+    const card = terminalSurface === 'card' && !$('approval-card').hidden;
+    const fresh = terminalView && Date.now() - terminalView.at < 25000;
+    $('approval-enter').disabled = !card || !fresh || terminalBusy || Boolean(pending.terminal) || !approvalEligible();
+    $('approval-refresh').disabled = !card || terminalBusy || Boolean(pending.terminal);
+    renderTerminalButtons();
+    if (card) {
+        $('approval-state').textContent = pending.terminal
+            ? pending.terminal.state === 'unknown' ? '結果が不明です。「端末を開く」でPCの結果を確認して解除してください。' : '端末への送信結果を確認しています…'
+            : terminalBinding?.inputError ? terminalBinding.inputError
+            : !terminalView ? '会話の状態を確認中です。再操作には表示を更新してください。'
+            : !fresh ? '表示が古くなりました。更新して選択中の項目を確認してください。'
+            : `${terminalBinding.paneId} · 端末の選択中の項目を確認してください。`;
+    }
 }
 
 function currentTerminal(request, paneId) {
-    return request === terminalRequest && $('terminal-dialog').open && (paneId === undefined || $('pane-select').value === paneId);
+    return request === terminalRequest && (terminalSurface === 'card'
+        ? approvalEligible() && terminalOwner?.id === selected && (paneId === undefined || !terminalBinding || terminalBinding.paneId === paneId)
+        : $('terminal-dialog').open && (paneId === undefined || $('pane-select').value === paneId));
 }
 
 function releaseBinding(binding) {
@@ -750,10 +829,11 @@ function terminalPath(owner = terminalOwner) { return `${owner.resource}/${encod
 
 function invalidateTerminal() {
     terminalRequest++;
+    clearTimeout(approvalExpiry);
     const binding = terminalBinding;
     terminalBinding = null; terminalView = null; terminalBusy = false;
     if (binding) releaseBinding(binding);
-    $('terminal-screen').textContent = ''; terminalControls();
+    $('terminal-screen').textContent = ''; $('approval-screen').textContent = ''; terminalControls();
     return terminalRequest;
 }
 
@@ -768,6 +848,8 @@ function showTerminalResult(operation, result) {
 }
 
 async function openTerminal(owner) {
+    hideApproval();
+    terminalSurface = 'dialog';
     if ($('launch-dialog').open) $('launch-dialog').close();
     terminalOwner = owner?.resource ? owner : { resource: 'threads', id: selected };
     const target = terminalOwner, id = target.id, request = invalidateTerminal();
@@ -800,6 +882,9 @@ function closeTerminal({ returnToLaunch = true } = {}) {
     const returnLaunch = returnToLaunch && terminalOwner?.resource === 'launches' && launchId;
     invalidateTerminal();
     terminalOwner = null;
+    terminalSurface = null;
+    approvalAttempt = null;
+    hideApproval();
     terminalResultRequestId = null;
     if ($('terminal-dialog').open) $('terminal-dialog').close();
     $('terminal-text').value = ''; terminalControls();
@@ -827,25 +912,43 @@ async function bindTerminal() {
 async function refreshTerminal() {
     const binding = terminalBinding, request = terminalRequest;
     if (!binding || !currentTerminal(request, binding.paneId) || terminalBusy) return;
-    const screen = $('terminal-screen');
+    const card = terminalSurface === 'card';
+    const screen = $(card ? 'approval-screen' : 'terminal-screen');
     const atBottom = !binding.hasScreen || screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
     const scroll = screen.scrollTop;
     terminalBusy = true; terminalView = null; terminalControls();
+    const at = Date.now();
     try {
         const view = await api(`${terminalPath(binding)}/terminal?bindingId=${encodeURIComponent(binding.bindingId)}`);
         if (!currentTerminal(request, binding.paneId) || terminalBinding !== binding) return;
-        terminalView = view; binding.hasScreen = true; screen.textContent = view.text;
-        screen.scrollTop = atBottom ? screen.scrollHeight : scroll;
+        terminalView = { ...view, at }; binding.hasScreen = true; screen.textContent = view.text;
+        if (card) {
+            binding.inputError = null;
+            $('approval-card').hidden = false;
+            clearTimeout(approvalExpiry);
+            approvalExpiry = setTimeout(terminalControls, Math.max(0, 25000 - (Date.now() - at)));
+        }
+        screen.scrollTop = card || atBottom ? screen.scrollHeight : scroll;
         $('terminal-state').textContent = `${view.paneId} · ${binding.resource === 'launches' ? '起動したCodexで確認済み。' : '会話IDで関連付け済み。'}`;
     } catch (error) {
+        if (card && currentTerminal(request, binding.paneId) && terminalBinding === binding) {
+            approvalAttempt = null; approvalRetryAt = Date.now() + 2000; hideApproval();
+        }
         if (currentTerminal(request, binding.paneId) && terminalBinding === binding) $('terminal-state').textContent = `端末表示を更新できません。「この端末を表示」で選び直してください。${error.message}`;
     }
-    finally { if (request === terminalRequest && terminalBinding === binding) { terminalBusy = false; terminalControls(); } }
+    finally {
+        if (request === terminalRequest && terminalBinding === binding) {
+            terminalBusy = false; terminalControls();
+            if (card) screen.scrollTop = screen.scrollHeight;
+        }
+    }
 }
 
 async function terminalInput(key) {
     const binding = terminalBinding, view = terminalView;
     if (!binding || !view || !currentTerminal(terminalRequest, binding.paneId) || terminalBusy || pending.terminal) return;
+    const card = terminalSurface === 'card';
+    if (card && (key !== 'Enter' || Date.now() - view.at >= 25000)) { terminalControls(); return; }
     if (key === 'Ctrl-C' && !window.confirm(`${binding.paneId}へCtrl-Cを送信して処理を中断しますか？`)) return;
     const body = { requestId: requestId(), bindingId: binding.bindingId, viewId: view.viewId,
         ...(key ? { key, confirmInterrupt: key === 'Ctrl-C' } : { text: $('terminal-text').value }) };
@@ -860,7 +963,7 @@ async function terminalInput(key) {
     finally {
         if (request === terminalRequest && terminalBinding === binding) {
             terminalBusy = false; terminalView = null; terminalControls();
-            if (!pending.terminal) await refreshTerminal();
+            if (!pending.terminal && !card) await refreshTerminal();
         }
     }
 }
@@ -915,6 +1018,9 @@ $('resolve').addEventListener('click', () => {
 });
 $('terminal-open').addEventListener('click', openTerminal);
 $('composer-terminal').addEventListener('click', openTerminal);
+$('approval-terminal').addEventListener('click', openTerminal);
+$('approval-refresh').addEventListener('click', refreshTerminal);
+$('approval-enter').addEventListener('click', () => terminalInput('Enter'));
 $('terminal-close').addEventListener('click', closeTerminal);
 $('terminal-dialog').addEventListener('cancel', event => { event.preventDefault(); closeTerminal(); });
 $('bind').addEventListener('click', bindTerminal);
@@ -936,7 +1042,10 @@ for (const [key, label] of [['Enter', 'Enter'], ['Escape', 'Esc'], ['Tab', 'Tab'
     button.setAttribute('aria-label', key);
     button.addEventListener('click', () => terminalInput(key)); $('keys').append(button);
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) poll();
+    else { approvalAttempt = null; hideApproval(); }
+});
 $('notification-toggle').addEventListener('click', toggleNotifications);
 $('notification-test').addEventListener('click', testNotification);
 navigator.serviceWorker?.addEventListener('message', event => {

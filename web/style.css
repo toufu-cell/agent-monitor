@@ -71,6 +71,11 @@ details pre { margin: 0; max-height: 400px; border-radius: 0; }
 .tool-entry + .tool-entry { border-top: 1px solid #dce3ea; }
 .tool-label { font-family: SFMono-Regular, Menlo, monospace; font-size: 12px; padding: 10px 12px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 #composer-terminal { margin-bottom: 8px; color: var(--active); }
+#approval-card { flex: 0 1 auto; min-height: 0; max-height: 35dvh; min-width: 0; display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; border-top: 1px solid #dce3ea; background: var(--paper); }
+#approval-state { margin: 0; flex-shrink: 0; overflow-wrap: anywhere; }
+#approval-screen { margin: 0; min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #202c38; color: #eef2f7; padding: 8px; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; }
+.approval-actions button { font-size: 12px; padding: 6px 8px; min-height: 44px; }
 #questions { flex: 0 1 auto; max-height: 35dvh; overflow-y: auto; overscroll-behavior: contain; border-top: 1px solid #dce3ea; padding: 12px max(25px, calc((100% - 820px) / 2)); background: var(--paper); }
 .question + .question { border-top: 1px solid #cbd4de; margin-top: 16px; padding-top: 16px; }
 .question-title, .history-question { line-height: 1.75; overflow-wrap: anywhere; }
@@ -116,7 +121,11 @@ dialog select, #terminal-text { width: 100%; margin-bottom: 8px; }
     #reading-line { padding: 0 16px; }
     #history { padding: 18px 16px; }
     #composer { padding: 10px 12px max(10px, env(safe-area-inset-bottom)); }
+    #approval-card { max-height: 55dvh; }
+    .approval-visible #draft { height: 68px; }
+    .approval-visible #send:disabled, .approval-visible .composer-actions span { display: none; }
     #questions { padding: 10px 12px; }
     #draft, #launch-path, .question textarea { font-size: 16px; }
+    .composer-actions { flex-wrap: wrap; }
     .brand { padding-bottom: 18px; }
 }

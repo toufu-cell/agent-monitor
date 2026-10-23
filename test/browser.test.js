@@ -7,6 +7,45 @@ import { chromium } from 'playwright';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
 
+test('320px inline terminal keeps the selected option and Enter visible', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const selectedOption = '❯ 1. 今回だけ許可';
+    f.state.screen = [...Array.from({ length: 30 }, (_, i) => `端末の表示 ${i}`),
+        selectedOption, '  2. この会話では許可', '  3. 拒否して理由を伝える', '',
+        '↑↓で選択してEnterで確定', 'Escで戻る'].join('\n');
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 320, height: 640 }, isMobile: true, hasTouch: true });
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="b"]').click();
+    await page.waitForFunction(() => !document.getElementById('approval-enter').disabled);
+    await page.locator('#draft').fill('承認後に送る下書き');
+    const layout = await page.evaluate(selectedOption => {
+        const card = document.getElementById('approval-card'), screen = document.getElementById('approval-screen');
+        const enter = document.getElementById('approval-enter').getBoundingClientRect();
+        const preview = screen.getBoundingClientRect(), draft = document.getElementById('draft').getBoundingClientRect();
+        const range = document.createRange(), start = screen.textContent.indexOf(selectedOption);
+        range.setStart(screen.firstChild, start); range.setEnd(screen.firstChild, start + selectedOption.length);
+        const option = range.getBoundingClientRect();
+        return { width: document.documentElement.scrollWidth, height: card.getBoundingClientRect().height,
+            screenHeight: screen.clientHeight, bottom: screen.scrollHeight - screen.scrollTop - screen.clientHeight,
+            optionVisible: option.top >= preview.top && option.bottom <= preview.bottom,
+            draftVisible: draft.height >= 44 && draft.top >= 0 && draft.bottom <= innerHeight,
+            enterHeight: enter.height, enterBottom: enter.bottom };
+    }, selectedOption);
+    assert(layout.width <= 320); assert(layout.height <= 640 * .55 + 1);
+    assert(layout.optionVisible); assert(layout.draftVisible); assert(layout.bottom <= 1);
+    assert(layout.enterHeight >= 44); assert(layout.enterBottom <= 640);
+    assert.equal(await page.locator('#terminal-open').isVisible(), false);
+    assert.equal(await page.locator('#composer-terminal').isVisible(), false);
+    await mkdir('artifacts', { recursive: true });
+    await page.screenshot({ path: 'artifacts/mobile-approval-320.png', fullPage: true });
+    await page.locator('#approval-enter').click();
+    await page.waitForFunction(() => document.getElementById('approval-enter').disabled && !document.getElementById('approval-refresh').disabled);
+    assert.deepEqual(f.state.writes, [{ pane_id: 'w2:p2', keys: ['Enter'] }]);
+    assert.equal(await page.locator('#draft').inputValue(), '承認後に送る下書き');
+});
+
 test('mobile image previews decode all supported formats and upload only on send', async t => {
     const f = await fixture(); t.after(() => f.close());
     f.service.imageDir = await mkdtemp(join(tmpdir(), 'am-browser-images-'));
@@ -262,7 +301,7 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     await page.getByText('別の会話の出力です。', { exact: true }).waitFor();
     assert.equal(await page.getByText('新着の出力です。', { exact: true }).count(), 0);
     assert.equal(await page.locator('#send').isDisabled(), true);
-    await page.locator('#composer-terminal').click();
+    await page.locator('#approval-terminal').click();
     await page.waitForFunction(() => document.getElementById('pane-select').value === 'w2:p2');
     assert.equal(await page.locator('#pane-select').inputValue(), 'w2:p2');
     await page.locator('#terminal-close').click();

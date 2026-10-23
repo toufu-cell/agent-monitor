@@ -898,6 +898,147 @@ test('late operation lookups cannot clear a newer message or terminal submission
     }
 });
 
+test('inline terminal preserves its view, expires input and shares dialog recovery', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.screen = '<button>端末の文字</button>\n❯ 2. 今回だけ許可';
+    const { window, $ } = await mount(t, f, true);
+    window.document.querySelector('.thread-button[data-thread-id="b"]').click();
+    await waitFor(() => !$('approval-enter').disabled);
+    assert.equal($('approval-screen').textContent, f.state.screen);
+    assert.equal($('approval-screen').children.length, 0);
+    assert.equal($('terminal-open').hidden, true);
+    const viewReads = () => f.state.herdrCalls.filter(call => call.method === 'pane.read' && call.params.source === 'visible' && call.params.format === 'text').length;
+    const reads = viewReads();
+    const tick = async () => {
+        const history = holdResponse(window, path => path.includes('/history'));
+        window.document.dispatchEvent(new window.Event('visibilitychange'));
+        await waitFor(() => history.seen);
+        history.release(); await waitFor(() => history.consumed);
+    };
+    await tick();
+    assert.equal(viewReads(), reads);
+    const now = window.Date.now;
+    window.Date.now = () => now() + 25001;
+    $('approval-enter').click();
+    assert.equal($('approval-enter').disabled, true);
+    assert.equal(f.state.writes.length, 0);
+    window.Date.now = now;
+    $('approval-refresh').click(); await waitFor(() => !$('approval-enter').disabled);
+    f.state.screen += '\n端末表示の変更';
+    $('approval-enter').click();
+    await waitFor(() => !$('approval-refresh').disabled);
+    assert.deepEqual({ message: $('approval-state').textContent, disabled: $('approval-enter').disabled, dialog: $('terminal-dialog').open }, {
+        message: '端末への送信に失敗しました。端末表示が変わりました。更新して確認してください。', disabled: true, dialog: false,
+    });
+    $('approval-refresh').click(); await waitFor(() => !$('approval-enter').disabled);
+    assert.equal($('approval-state').textContent.includes('失敗'), false);
+    const held = holdResponse(window, path => path.endsWith('/terminal-input'));
+    $('approval-enter').click(); await waitFor(() => held.seen);
+    assert.equal($('approval-enter').disabled, true);
+    const operationId = JSON.parse(window.sessionStorage.getItem('pending')).terminal.requestId;
+    $('approval-terminal').click();
+    await waitFor(() => $('pane-select').value === 'w2:p2');
+    assert.equal($('approval-card').hidden, true);
+    await waitFor(() => f.service.bindings.size === 0);
+    $('bind').click(); await waitFor(() => !$('terminal-refresh').disabled);
+    assert.equal($('terminal-send').disabled, true);
+    held.fail(); await waitFor(() => !$('terminal-resolve').hidden);
+    assert.equal(JSON.parse(window.sessionStorage.getItem('pending')).terminal.requestId, operationId);
+    $('terminal-close').click();
+    $('draft').dispatchEvent(new window.Event('input'));
+    await waitFor(() => !$('approval-card').hidden);
+    assert.equal($('approval-enter').disabled, true);
+    assert.match($('approval-state').textContent, /端末を開く/);
+    $('approval-enter').click(); assert.equal(f.state.writes.length, 1);
+    await tick();
+    await waitFor(() => !JSON.parse(window.sessionStorage.getItem('pending')).terminal);
+    $('approval-refresh').click(); await waitFor(() => !$('approval-enter').disabled);
+    $('approval-enter').click();
+    await waitFor(() => f.state.writes.length === 2 && !$('approval-refresh').disabled);
+    assert.equal($('approval-enter').disabled, true);
+    assert.deepEqual(f.state.writes.map(write => write.keys), [['Enter'], ['Enter']]);
+    f.state.threads.get('b').status = { type: 'active', activeFlags: [] };
+    f.state.panes[1].agent_status = 'working';
+    await tick(); await waitFor(() => $('approval-card').hidden && f.service.bindings.size === 0);
+    assert.equal($('approval-state').textContent, '');
+});
+
+test('inline terminal retries failed binding and screen reads with bounded requests', async t => {
+    for (const endpoint of ['/bind', '/terminal?']) {
+        await t.test(endpoint, async t => {
+            const f = await fixture(); t.after(() => f.close());
+            const { window, $ } = await mount(t, f, true);
+            const original = window.fetch;
+            let attempts = 0, requests = 0;
+            window.fetch = (path, options) => {
+                if (path.endsWith('/panes') || path.endsWith('/bind') || path.includes('/terminal?')) requests++;
+                if (path.includes(endpoint) && ++attempts === 1) {
+                    return Promise.resolve(new Response(JSON.stringify({ error: '一時的に取得できません。' }), { status: 503 }));
+                }
+                return original(path, options);
+            };
+            window.document.querySelector('.thread-button[data-thread-id="b"]').click();
+            await waitFor(() => attempts === 1 && !$('composer-terminal').hidden);
+            await waitFor(() => f.service.bindings.size === 0);
+            assert.equal($('approval-card').hidden, true);
+            assert.equal($('terminal-open').hidden, false);
+            const beforeRetry = requests;
+            for (let i = 0; i < 10; i++) $('draft').dispatchEvent(new window.Event('input'));
+            assert.equal(requests, beforeRetry);
+            const now = window.Date.now;
+            window.Date.now = () => now() + 2001;
+            window.document.dispatchEvent(new window.Event('visibilitychange'));
+            await waitFor(() => !$('approval-enter').disabled);
+            window.Date.now = now;
+            assert.equal(attempts, 2);
+            assert.equal($('approval-screen').textContent, f.state.screen);
+            assert.equal(f.service.bindings.size, 1);
+            assert.equal(f.state.writes.length, 0);
+            assert.equal($('send-state').hidden, true);
+            $('approval-terminal').click();
+            assert.equal($('send-state').hidden, false);
+            await waitFor(() => $('terminal-dialog').open && f.service.bindings.size === 0);
+        });
+    }
+});
+
+test('inline terminal hides on ambiguous mapping, thread switch and loss of trusted state', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { window, $ } = await mount(t, f, true);
+    const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
+    select('b'); await waitFor(() => !$('approval-enter').disabled);
+    select('a'); await waitFor(() => f.service.bindings.size === 0 && !$('draft').disabled);
+    assert.equal($('approval-card').hidden, true);
+    const pane = structuredClone(f.state.panes[1]);
+    pane.pane_id = 'w2:p3'; pane.terminal_id = 'term3';
+    f.state.panes.push(pane);
+    f.state.processes.set(pane.pane_id, f.state.processes.get('w2:p2'));
+    const ambiguous = holdResponse(window, path => path.endsWith('/panes'));
+    select('b');
+    await waitFor(() => !$('composer-terminal').hidden && $('send-state').textContent.includes('承認'));
+    await waitFor(() => ambiguous.seen);
+    ambiguous.release(); await waitFor(() => ambiguous.consumed);
+    assert.equal($('approval-card').hidden, true); assert.equal(f.service.bindings.size, 0);
+    f.state.panes.pop();
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => !$('approval-enter').disabled);
+    f.state.failState = true;
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => $('approval-card').hidden && f.service.bindings.size === 0);
+    assert.equal($('approval-enter').disabled, true);
+    f.state.failState = false;
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => !$('approval-enter').disabled);
+    const oldBinding = [...f.service.bindings.keys()][0];
+    f.state.panes[1].terminal_id = 'replacement-terminal';
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => !f.service.bindings.has(oldBinding) && !$('approval-enter').disabled);
+    f.state.threads.get('b').status.activeFlags = ['waitingOnApprovalOrInput'];
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => $('approval-card').hidden && f.service.bindings.size === 0);
+    assert.equal($('composer-terminal').hidden, false);
+});
+
 test('mobile navigation preserves reading position, tool disclosure, drafts and list focus', async t => {
     const f = await fixture(); t.after(() => f.close());
     const turn = f.state.turns.get('a').at(-1);
@@ -944,8 +1085,9 @@ test('mobile navigation preserves reading position, tool disclosure, drafts and 
     select('b');
     await waitFor(() => $('turns').textContent.includes('別の会話の出力'));
     assert.equal($('status').textContent, '承認・回答待ち');
-    assert.equal($('composer-terminal').hidden, false);
-    $('composer-terminal').click();
+    await waitFor(() => !$('approval-card').hidden);
+    assert.equal($('composer-terminal').hidden, true);
+    $('approval-terminal').click();
     await waitFor(() => $('pane-select').options.length === 2);
     assert.equal($('terminal-dialog').open, true);
     assert.equal($('pane-select').value, 'w2:p2');
