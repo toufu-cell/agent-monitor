@@ -79,6 +79,82 @@ test('launch creation is serialized and normalized workspaces and request IDs ar
     assert.equal(f.state.writes.filter(write => write.text === 'env -u CODEX_THREAD_ID codex').length, 3);
 });
 
+test('Claude launch exposes the original terminal before session discovery and hands off for sending', async t => {
+    const f = await launchFixture(t);
+    f.state.launchThread = false;
+    const body = { path: f.path, provider: 'claude', requestId: 'launch_claude_1234567890' };
+    for (const provider of [null, '', 'invalid', {}, 1]) {
+        assert.equal((await f.request('/api/launches', { ...body, provider })).status, 400);
+    }
+    await f.request('/api/launches', body);
+    assert.equal((await f.request('/api/launches', { ...body, provider: 'codex' })).status, 409);
+    assert.equal((await f.request('/api/launches', { path: f.path, requestId: body.requestId })).status, 409);
+    const waiting = await f.settled(body.requestId);
+    assert.equal(waiting.provider, 'claude'); assert.equal(waiting.phase, 'claude');
+    assert.equal(waiting.state, 'waiting'); assert.equal(waiting.terminalAvailable, true);
+    assert.equal(waiting.pane.title, '起動したClaude');
+    assert.equal(f.state.writes[0].text, 'env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID claude');
+    const endpoint = `/api/launches/${body.requestId}`;
+    assert.equal((await f.request(`${endpoint}/bind`, { paneId: 'w1:p1' })).status, 409);
+    const binding = (await f.request(`${endpoint}/bind`, { paneId: waiting.pane.id })).body;
+    const view = (await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).body;
+    assert.equal((await f.request(`${endpoint}/terminal-input`, { requestId: 'claude_first_input_123456',
+        bindingId: binding.bindingId, viewId: view.viewId, text: '最初の指示' })).body.state, 'succeeded');
+    const id = f.state.resolveLaunch(f.state.panes.find(pane => pane.pane_id === waiting.pane.id));
+    const ready = await f.status(body.requestId);
+    assert.equal(ready.state, 'ready'); assert.equal(ready.thread.id, id); assert.equal(ready.thread.provider, 'claude');
+    assert.equal(f.service.bindings.has(binding.bindingId), false);
+    assert.equal((await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).status, 409);
+    const sent = await f.request(`/api/threads/${id}/send`, { requestId: 'claude_next_input_123456', text: '続きの指示' });
+    assert.equal(sent.body.state, 'succeeded');
+    assert.equal(f.state.writes.at(-1).text, '\x1b[200~' + '続きの指示' + '\x1b[201~');
+});
+
+test('Claude launch keeps its terminal when Herdr reports the session before the session list', async t => {
+    const f = await launchFixture(t);
+    f.state.launchThread = false;
+    const requestId = 'launch_claude_early_hook_123456';
+    await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+    const launched = await f.settled(requestId);
+    const pane = f.state.panes.find(pane => pane.pane_id === launched.pane.id);
+    const id = f.state.resolveLaunch(pane);
+    const session = f.state.claudeSessions.pop();
+    const waiting = await f.status(requestId);
+    assert.equal(waiting.state, 'waiting'); assert.equal(waiting.terminalAvailable, true);
+    const endpoint = `/api/launches/${requestId}`;
+    const binding = (await f.request(`${endpoint}/bind`, { paneId: pane.pane_id })).body;
+    const view = await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`);
+    assert.equal(view.status, 200);
+    const sent = await f.request(`${endpoint}/terminal-input`, { requestId: 'claude_early_hook_input_123456',
+        bindingId: binding.bindingId, viewId: view.body.viewId, key: 'Enter' });
+    assert.equal(sent.body.state, 'succeeded');
+    assert.equal(f.state.writes.at(-1).pane_id, pane.pane_id);
+    f.state.claudeSessions.push(session);
+    const ready = await f.status(requestId);
+    assert.equal(ready.state, 'ready'); assert.equal(ready.thread.id, id);
+    assert.equal((await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).status, 409);
+});
+
+test('Claude launch rejects ambiguous sessions, pane changes and replacement processes', async t => {
+    for (const change of ['ambiguous', 'mismatch', 'pane', 'process', 'multiple']) {
+        const f = await launchFixture(t);
+        f.state.launchThread = false;
+        const body = { path: f.path, provider: 'claude', requestId: `launch_claude_${change}_123456` };
+        await f.request('/api/launches', body);
+        const waiting = await f.settled(body.requestId);
+        const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
+        const process = f.state.processes.get(pane.pane_id);
+        if (change === 'ambiguous' || change === 'mismatch') {
+            f.state.resolveLaunch(pane);
+            if (change === 'ambiguous') f.state.claudeSessions.push({ ...f.state.claudeSessions[0] });
+            else pane.agent_session.value = 'different';
+        } else if (change === 'pane') pane.terminal_id = 'replacement';
+        else if (change === 'process') process.foreground_processes[0].pid++;
+        else process.foreground_processes.push({ ...process.foreground_processes[0], pid: 9999 });
+        assert.equal((await f.status(body.requestId)).state, 'unknown', change);
+    }
+});
+
 test('launch trust terminal is restricted to the original Codex and hands off by PID resources', async t => {
     const f = await launchFixture(t);
     f.state.launchThread = false; f.state.busyShell = true;

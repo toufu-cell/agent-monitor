@@ -160,17 +160,28 @@ function providerName(provider) {
     return provider === 'claude' ? 'Claude Code' : 'Codex';
 }
 
+function launchName(provider) {
+    return provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'CLI';
+}
+
 function renderLaunch() {
     const state = launchState?.state;
     const active = launchId && !['failed', 'ended'].includes(state);
+    if (!active && !$('launch-provider').value) $('launch-provider').value = 'codex';
+    const provider = active ? launchState?.provider : $('launch-provider').value;
+    const name = launchName(provider);
+    if (active) $('launch-provider').value = provider || '';
+    $('launch-provider').disabled = launchBusy || Boolean(active);
     $('launch-submit').disabled = launchBusy || Boolean(active);
+    $('launch-submit').textContent = `${name}を起動`;
+    $('launch-title').textContent = active ? `${name}の起動状態` : '新しい会話';
     $('launch-path').disabled = launchBusy || Boolean(active);
-    $('launch-open').textContent = active ? '起動状態を確認' : '新しいCodex会話';
+    $('launch-open').textContent = active ? '起動状態を確認' : '新しい会話';
     $('launch-state').textContent = launchError || (state === 'unknown'
         ? '起動結果が不明です。PCで確認するまで新しい起動を停止しています。'
-        : state === 'waiting' ? 'PCでCodexの起動を待っています。承認が必要な場合は端末を開いてください。'
+        : state === 'waiting' ? `PCで${name}の起動を待っています。承認が必要な場合は端末を開いてください。`
         : state === 'failed' ? `起動できませんでした。${launchState.message || ''}`
-        : state === 'ended' ? '起動した端末のCodexは終了しました。'
+        : state === 'ended' ? `起動した端末の${launchName(launchState.provider)}は終了しました。`
         : '起動後に会話を開きます。この画面を閉じてもPCの処理は続きます。');
     $('launch-state').classList.toggle('error', Boolean(launchError) || ['failed', 'unknown'].includes(state));
     $('launch-terminal').hidden = !launchState?.terminalAvailable;
@@ -229,9 +240,10 @@ async function startLaunch(event) {
     }
     launchId = requestId();
     sessionStorage.setItem('launchRequestId', launchId);
-    launchState = { requestId: launchId, state: 'waiting' };
+    const provider = $('launch-provider').value;
+    launchState = { requestId: launchId, provider, state: 'waiting' };
     launchBusy = true; launchError = ''; renderLaunch();
-    try { await settleLaunch(await api('launches', { path, requestId: launchId })); }
+    try { await settleLaunch(await api('launches', { path, provider, requestId: launchId })); }
     catch (error) {
         if (error.status && error.status < 500) {
             launchId = null; sessionStorage.removeItem('launchRequestId'); launchState = null;
@@ -836,7 +848,7 @@ async function refreshTerminal() {
         if (!currentTerminal(request, binding.paneId) || terminalBinding !== binding) return;
         terminalView = view; binding.hasScreen = true; screen.textContent = view.text;
         screen.scrollTop = atBottom ? screen.scrollHeight : scroll;
-        $('terminal-state').textContent = `${view.paneId} · ${binding.resource === 'launches' ? '起動したCodexで確認済み。' : '会話IDで関連付け済み。'}`;
+        $('terminal-state').textContent = `${view.paneId} · ${binding.resource === 'launches' ? `起動した${launchName(launchState?.provider)}で確認済み。` : '会話IDで関連付け済み。'}`;
     } catch (error) {
         if (currentTerminal(request, binding.paneId) && terminalBinding === binding) $('terminal-state').textContent = `端末表示を更新できません。「この端末を表示」で選び直してください。${error.message}`;
     }
@@ -868,6 +880,7 @@ async function terminalInput(key) {
 $('search').addEventListener('input', renderList);
 $('launch-open').addEventListener('click', openLaunch);
 $('launch-form').addEventListener('submit', startLaunch);
+$('launch-provider').addEventListener('change', renderLaunch);
 $('launch-close').addEventListener('click', () => $('launch-dialog').close());
 $('launch-dialog').addEventListener('cancel', event => { event.preventDefault(); $('launch-dialog').close(); });
 $('launch-resolve').addEventListener('click', confirmLaunch);

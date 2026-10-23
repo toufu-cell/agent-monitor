@@ -684,6 +684,45 @@ test('launch UI prevents repeat requests, recovers by ID and hands off after tru
     assert.equal(window.JSON.parse(window.sessionStorage.getItem('drafts')).a, '元の会話の下書き');
 });
 
+test('Claude selection is fixed by the snapshot and unknown restored launches use neutral labels', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.launchThread = false;
+    const { window, $ } = await mount(t, f, true);
+    assert.equal($('launch-provider').value, 'codex');
+    $('launch-open').click();
+    $('launch-provider').value = 'claude'; $('launch-provider').dispatchEvent(new window.Event('change'));
+    assert.equal($('launch-submit').textContent, 'Claudeを起動');
+    $('launch-path').value = process.cwd();
+    $('launch-form').dispatchEvent(new window.Event('submit', { cancelable: true }));
+    await waitFor(() => {
+        window.document.dispatchEvent(new window.Event('visibilitychange'));
+        return !$('launch-terminal').hidden;
+    });
+    const id = window.sessionStorage.getItem('launchRequestId');
+    assert.equal($('launch-provider').disabled, true);
+    const restored = await mount(t, f, true, { launchRequestId: id });
+    restored.window.document.dispatchEvent(new restored.window.Event('visibilitychange'));
+    await waitFor(() => !restored.$('launch-terminal').hidden);
+    assert.equal(restored.$('launch-provider').value, 'claude');
+    assert.match(restored.$('launch-state').textContent, /Claude/);
+    assert.doesNotMatch(restored.$('launch-title').textContent, /Codex/);
+    const missing = await mount(t, f, true, { launchRequestId: 'missing_launch_12345678' });
+    missing.$('launch-open').click();
+    await waitFor(() => !missing.$('launch-resolve').hidden);
+    assert.equal(missing.$('launch-title').textContent, 'CLIの起動状態');
+    assert.equal(missing.$('launch-provider').value, '');
+    f.service.launches.get(id).state = 'unknown';
+    const blockedId = 'blocked_launch_12345678';
+    await f.request('/api/launches', { path: process.cwd(), provider: 'codex', requestId: blockedId });
+    const blocked = await mount(t, f, true, { launchRequestId: blockedId });
+    await waitFor(() => {
+        blocked.window.document.dispatchEvent(new blocked.window.Event('visibilitychange'));
+        return blocked.window.sessionStorage.getItem('launchRequestId') === id
+            && blocked.$('launch-provider').value === 'claude';
+    });
+    assert.equal(blocked.$('launch-title').textContent, 'Claudeの起動状態');
+});
+
 test('unknown launch requires PC confirmation before a new request', async t => {
     const f = await fixture(); t.after(() => f.close());
     f.state.malformedCreate = true;

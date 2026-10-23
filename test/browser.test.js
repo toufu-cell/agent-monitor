@@ -307,7 +307,7 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     assert.deepEqual(errors, []);
 });
 
-test('mobile launch validates paths, restores pending state and opens the resolved conversation', async t => {
+for (const provider of ['codex', 'claude']) test(`mobile ${provider} launch restores pending state and opens the conversation`, async t => {
     const f = await fixture(); t.after(() => f.close());
     f.state.launchThread = false;
     const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
@@ -316,7 +316,12 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(`${f.origin}/#${f.token}`);
-    await page.getByRole('button', { name: '新しいCodex会話', exact: true }).click();
+    await page.getByRole('button', { name: '新しい会話', exact: true }).click();
+    assert.equal(await page.locator('#launch-provider').inputValue(), 'codex');
+    await page.locator('#launch-provider').selectOption(provider);
+    const selectBox = await page.locator('#launch-provider').boundingBox();
+    assert(selectBox.height >= 44);
+    assert.equal(await page.locator('#launch-submit').textContent(), provider === 'claude' ? 'Claudeを起動' : 'Codexを起動');
     await page.locator('#launch-path').fill('relative/path');
     await page.locator('#launch-submit').click();
     assert.match(await page.locator('#launch-state').textContent(), /絶対パス/);
@@ -327,9 +332,11 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     const requestId = await page.evaluate(() => sessionStorage.getItem('launchRequestId'));
     assert.equal(await page.locator('#launch-submit').isDisabled(), true);
     await mkdir('artifacts', { recursive: true });
-    await page.screenshot({ path: 'artifacts/mobile-launch.png', fullPage: true });
+    await page.screenshot({ path: `artifacts/mobile-${provider}-launch.png`, fullPage: true });
     await page.reload();
     await page.getByRole('button', { name: '起動状態を確認', exact: true }).click();
+    assert.equal(await page.locator('#launch-provider').inputValue(), provider);
+    assert.equal(await page.locator('#launch-provider').isDisabled(), true);
     await page.locator('#launch-terminal').click();
     assert.equal(await page.locator('#launch-dialog').evaluate(dialog => dialog.open), false);
     const paneId = await page.locator('#pane-select').inputValue();
@@ -338,7 +345,7 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     assert.equal(await page.evaluate(() => sessionStorage.getItem('launchRequestId')), requestId);
     await page.locator('#bind').click();
     await page.waitForFunction(() => !document.getElementById('terminal-send').disabled);
-    await page.screenshot({ path: 'artifacts/mobile-launch-terminal.png', fullPage: true });
+    await page.screenshot({ path: `artifacts/mobile-${provider}-launch-terminal.png`, fullPage: true });
     await page.getByRole('button', { name: 'Enter', exact: true }).click();
     await page.waitForFunction(() => document.getElementById('terminal-result').textContent.includes('端末へ送信しました。'));
     await page.locator('#terminal-close').click();
@@ -349,7 +356,11 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     await page.locator('#draft').fill('起動後の最初の指示');
     await page.locator('#send').click();
     await page.waitForFunction(() => document.getElementById('draft').value === '');
-    assert.equal(f.state.calls.find(call => call.method === 'thread/queue/add').params.threadId, threadId);
+    if (provider === 'codex') assert.equal(f.state.calls.find(call => call.method === 'thread/queue/add').params.threadId, threadId);
+    else {
+        assert(threadId.startsWith('claude:'));
+        assert.equal(f.state.writes.at(-1).pane_id, paneId);
+    }
     assert.equal(await page.evaluate(() => sessionStorage.getItem('launchRequestId')), null);
     assert.deepEqual(errors, []);
 });

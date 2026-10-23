@@ -13,7 +13,7 @@
 <body>
     <aside id="sidebar" aria-label="会話一覧">
         <header class="brand"><strong>Agent Monitor</strong></header>
-        <button id="launch-open">新しいCodex会話</button>
+        <button id="launch-open">新しい会話</button>
         <section id="notifications" aria-label="通知">
             <p id="notification-state" class="notice" role="status">通知を確認中…</p>
             <div class="notification-actions"><button id="notification-toggle" hidden disabled>通知を有効にする</button><button id="notification-test" hidden>テスト送信</button></div>
@@ -54,8 +54,10 @@
         </section>
     </main>
     <dialog id="launch-dialog" aria-labelledby="launch-title">
-        <header><h2 id="launch-title">新しいCodex会話</h2><button id="launch-close">閉じる</button></header>
+        <header><h2 id="launch-title">新しい会話</h2><button id="launch-close">閉じる</button></header>
         <form id="launch-form">
+            <label for="launch-provider">起動するCLI</label>
+            <select id="launch-provider"><option value="codex">Codex</option><option value="claude">Claude</option></select>
             <label for="launch-path">PCの作業ディレクトリ</label>
             <input id="launch-path" required maxlength="4096" placeholder="~/git/agent-monitor" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="launch-help launch-state">
             <p id="launch-help" class="notice">PCにある絶対パスか~/で始まるパスを入力します。同じ場所のworkspaceに新しいタブを開きます。</p>

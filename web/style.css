@@ -26,7 +26,8 @@ textarea { resize: vertical; width: 100%; max-height: 30dvh; line-height: 1.6; }
 .notification-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .notification-actions button { font-size: 13px; }
 #launch-dialog { max-width: 560px; }
-#launch-path { width: 100%; }
+#launch-path, #launch-provider { width: 100%; }
+#launch-provider { margin-bottom: 16px; }
 #launch-help, #launch-state { overflow-wrap: anywhere; }
 #thread-list { overflow-y: auto; margin: 0 -16px; padding: 0 10px 30px; }
 .project-group { font-size: 12px; color: var(--muted); margin: 24px 10px 8px; overflow-wrap: anywhere; }
