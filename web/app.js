@@ -34,6 +34,10 @@ let launchState = launchId ? { requestId: launchId, state: 'waiting' } : null;
 let launchBusy = false;
 let launchPolling = false;
 let launchError = '';
+let folderListing = null;
+let folderRequest = 0;
+let folderBusy = false;
+let folderError = '';
 const caches = new Map();
 const ranks = new Map();
 const drafts = getStored('drafts', {});
@@ -175,6 +179,63 @@ function renderLaunch() {
     $('launch-state').classList.toggle('error', Boolean(launchError) || ['failed', 'unknown'].includes(state));
     $('launch-terminal').hidden = !launchState?.terminalAvailable;
     $('launch-resolve').hidden = state !== 'unknown' || launchBusy;
+    renderFolders();
+}
+
+function invalidateFolders() {
+    folderRequest++;
+    folderBusy = false;
+}
+
+function closeLaunch() {
+    invalidateFolders();
+    folderListing = null; folderError = '';
+    $('folder-browser').hidden = true;
+    $('folder-list').replaceChildren();
+    renderFolders();
+    $('launch-dialog').close();
+}
+
+function renderFolders() {
+    const disabled = $('launch-path').disabled;
+    $('folder-browse').disabled = disabled;
+    $('folder-browse').setAttribute('aria-expanded', String(!$('folder-browser').hidden));
+    $('folder-path').textContent = folderListing?.path || 'フォルダを選んでください。';
+    $('folder-parent').disabled = disabled || folderBusy || !folderListing?.parent;
+    $('folder-use').disabled = disabled || folderBusy || !folderListing;
+    $('folder-state').textContent = folderBusy ? 'フォルダを読み込み中…' : folderError
+        || (folderListing && !folderListing.truncated && !folderListing.directories.length ? '子フォルダはありません。' : '');
+    $('folder-state').classList.toggle('error', Boolean(folderError));
+    $('folder-limit').hidden = !folderListing?.truncated;
+    $('folder-limit').textContent = folderListing?.directories.length
+        ? '一覧の一部を表示しています。見つからないフォルダはパスを直接入力できます。'
+        : '一覧の取得が上限に達しました。走査した範囲に子フォルダはありません。パスを直接入力できます。';
+    $('folder-list').setAttribute('aria-busy', String(folderBusy));
+    for (const button of $('folder-list').querySelectorAll('button')) button.disabled = disabled || folderBusy;
+}
+
+async function browseFolders(path) {
+    if ($('launch-path').disabled) return;
+    const request = ++folderRequest;
+    const focusInList = $('folder-list').contains(document.activeElement);
+    folderBusy = true; folderError = ''; renderFolders();
+    try {
+        const listing = await api(`directories${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+        if (request !== folderRequest) return;
+        folderListing = listing;
+        $('folder-list').replaceChildren(...listing.directories.map(directory => {
+            const button = node('button', directory.name);
+            button.type = 'button';
+            button.addEventListener('click', () => browseFolders(directory.path));
+            return button;
+        }));
+        if (focusInList) $('folder-path').focus();
+    } catch (error) {
+        if (request !== folderRequest) return;
+        folderError = `フォルダを取得できません。${error.message}`;
+    } finally {
+        if (request === folderRequest) { folderBusy = false; renderFolders(); }
+    }
 }
 
 function openLaunch() {
@@ -199,7 +260,7 @@ async function settleLaunch(result) {
     if (!ranks.has(thread.id)) ranks.set(thread.id, ranks.size);
     cacheFor(thread.id).thread = thread;
     launchId = null; sessionStorage.removeItem('launchRequestId');
-    $('launch-dialog').close();
+    closeLaunch();
     closeTerminal({ returnToLaunch: false });
     renderLaunch(); renderList();
     await selectThread(thread.id);
@@ -222,6 +283,7 @@ async function refreshLaunch() {
 async function startLaunch(event) {
     event.preventDefault();
     if ($('launch-submit').disabled) return;
+    invalidateFolders();
     const path = $('launch-path').value;
     if (!path.trim() || path.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(path)
         || !(path.startsWith('/') || path === '~' || path.startsWith('~/'))) {
@@ -768,7 +830,7 @@ function showTerminalResult(operation, result) {
 }
 
 async function openTerminal(owner) {
-    if ($('launch-dialog').open) $('launch-dialog').close();
+    if ($('launch-dialog').open) closeLaunch();
     terminalOwner = owner?.resource ? owner : { resource: 'threads', id: selected };
     const target = terminalOwner, id = target.id, request = invalidateTerminal();
     terminalResultRequestId = pending.terminal?.requestId || null;
@@ -868,12 +930,30 @@ async function terminalInput(key) {
 $('search').addEventListener('input', renderList);
 $('launch-open').addEventListener('click', openLaunch);
 $('launch-form').addEventListener('submit', startLaunch);
-$('launch-close').addEventListener('click', () => $('launch-dialog').close());
-$('launch-dialog').addEventListener('cancel', event => { event.preventDefault(); $('launch-dialog').close(); });
+$('launch-path').addEventListener('input', () => {
+    invalidateFolders(); folderError = '';
+    $('folder-browser').hidden = true; renderFolders();
+});
+$('folder-browse').addEventListener('click', () => {
+    $('folder-browser').hidden = !$('folder-browser').hidden;
+    if ($('folder-browser').hidden) { invalidateFolders(); renderFolders(); }
+    else browseFolders($('launch-path').value);
+});
+$('folder-parent').addEventListener('click', () => {
+    if (!$('folder-parent').disabled) browseFolders(folderListing.parent);
+});
+$('folder-use').addEventListener('click', () => {
+    if ($('folder-use').disabled) return;
+    invalidateFolders();
+    $('launch-path').value = folderListing.path;
+    $('folder-browser').hidden = true; renderFolders(); $('launch-path').focus();
+});
+$('launch-close').addEventListener('click', closeLaunch);
+$('launch-dialog').addEventListener('cancel', event => { event.preventDefault(); closeLaunch(); });
 $('launch-resolve').addEventListener('click', confirmLaunch);
 $('launch-terminal').addEventListener('click', () => {
     if (!launchId || !launchState?.terminalAvailable) return;
-    $('launch-dialog').close();
+    closeLaunch();
     openTerminal({ resource: 'launches', id: launchId });
 });
 $('draft').addEventListener('input', () => { if (selected) drafts[selected] = $('draft').value; save(); renderComposer(); });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
@@ -305,6 +305,48 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.screenshot({ path: 'artifacts/desktop.png', fullPage: true });
     assert.deepEqual(errors, []);
+});
+
+test('folder picker fits 320px touch screens and launches the chosen directory', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.initialShellPending = true;
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-browser-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const child = join(root, 'a-long-project-folder-name-for-a-narrow-phone-screen');
+    await mkdir(child);
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 }, isMobile: true, hasTouch: true });
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('#launch-open').tap();
+    await page.locator('#launch-path').fill(root);
+    await page.locator('#folder-browse').tap();
+    await page.getByRole('button', { name: 'a-long-project-folder-name-for-a-narrow-phone-screen', exact: true }).waitFor();
+    const layout = await page.evaluate(() => {
+        const dialog = document.getElementById('launch-dialog');
+        const ids = ['folder-browse', 'folder-parent', 'folder-use'];
+        const controls = [...ids.map(id => document.getElementById(id)), ...document.querySelectorAll('#folder-list button')];
+        return { overflow: dialog.scrollWidth > dialog.clientWidth,
+            controls: controls.map(button => { const box = button.getBoundingClientRect(); return { x: box.x, right: box.right, height: box.height }; }),
+            actionsBottom: document.querySelector('.folder-actions').getBoundingClientRect().bottom,
+            listTop: document.getElementById('folder-list').getBoundingClientRect().top };
+    });
+    assert.equal(layout.overflow, false);
+    assert(layout.controls.every(box => box.x >= 0 && box.right <= 320 && box.height >= 44));
+    assert(layout.actionsBottom <= layout.listTop);
+    await mkdir('artifacts', { recursive: true });
+    await page.screenshot({ path: 'artifacts/folder-picker-320.png', fullPage: true });
+    await page.locator('#folder-list button').tap();
+    await page.waitForFunction(path => document.getElementById('folder-path').textContent === path, child);
+    await page.getByText('子フォルダはありません。', { exact: true }).waitFor();
+    await page.locator('#folder-use').tap();
+    assert.equal(await page.locator('#launch-path').inputValue(), child);
+    assert.equal(await page.locator('#folder-browser').isHidden(), true);
+    const launched = page.waitForResponse(response => response.url() === `${f.origin}/api/launches` && response.request().method() === 'POST');
+    await page.locator('#launch-submit').tap();
+    await launched;
+    await page.waitForFunction(() => document.getElementById('folder-browse').disabled);
+    assert.equal(f.state.creates[0].params.cwd, child);
 });
 
 test('mobile launch validates paths, restores pending state and opens the resolved conversation', async t => {

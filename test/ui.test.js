@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile, mkdtemp, realpath, mkdir, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { JSDOM } from 'jsdom';
 import { fixture, codexScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
@@ -612,6 +613,124 @@ test('UI retains history and drafts, rejects stale responses, and recovers after
     $('send').click();
     assert.equal(f.state.writes.length, previousWrites + 2);
     assert.equal(JSON.parse(window.sessionStorage.getItem('pending')).a.state, 'unknown');
+});
+
+test('folder picker distinguishes incomplete results from an empty directory', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-limit-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await Promise.all(Array.from({ length: 201 }, (_, i) => mkdir(join(root, `folder-${i}`))));
+    const { window, $ } = await mount(t, f, true);
+    assert.equal($('launch-path').nextElementSibling, $('launch-help'));
+    assert.match($('folder-list-help').textContent, /子フォルダ.*タップすると開きます/);
+    assert.equal($('folder-list').getAttribute('aria-labelledby'), 'folder-list-help');
+    $('launch-open').click(); $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => !$('folder-limit').hidden);
+    assert.equal($('folder-list').querySelectorAll('button').length, 200);
+    assert.match($('folder-limit').textContent, /パスを直接入力/);
+    assert.equal($('folder-state').textContent, '');
+    $('folder-list').querySelector('button').click();
+    await waitFor(() => $('folder-state').textContent === '子フォルダはありません。');
+    assert.equal($('folder-limit').hidden, true);
+    const files = join(root, 'files'); await mkdir(files);
+    await Promise.all(Array.from({ length: 2001 }, (_, i) => writeFile(join(files, `file-${i}`), '')));
+    $('launch-path').value = files; $('launch-path').dispatchEvent(new window.Event('input'));
+    $('folder-browse').click();
+    await waitFor(() => !$('folder-limit').hidden);
+    assert.equal($('folder-list').childElementCount, 0);
+    assert.equal($('folder-state').textContent, '');
+    assert.match($('folder-limit').textContent, /上限.*走査した範囲.*パスを直接入力/);
+});
+
+test('closing launch discards pending folder responses and reopens from the current input', async t => {
+    for (const close of ['button', 'escape', 'handoff']) {
+        await t.test(close, async t => {
+            const f = await fixture(); t.after(() => f.close());
+            const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-close-ui-')));
+            t.after(() => rm(root, { recursive: true, force: true }));
+            const child = join(root, 'child'); await mkdir(child);
+            const { window, $ } = await mount(t, f, true);
+            window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+            await waitFor(() => !$('terminal-open').disabled);
+            $('launch-open').click(); $('launch-path').value = root;
+            const held = holdResponse(window, path => path.startsWith('/api/directories'));
+            $('folder-browse').click(); await waitFor(() => held.seen);
+            if (close === 'button') $('launch-close').click();
+            else if (close === 'escape') $('launch-dialog').dispatchEvent(new window.Event('cancel', { cancelable: true }));
+            else $('terminal-open').click();
+            assert.equal($('launch-dialog').open, false);
+            assert.equal($('folder-browser').hidden, true);
+            assert.equal($('folder-browse').getAttribute('aria-expanded'), 'false');
+            held.release(); await waitFor(() => held.consumed);
+            assert.equal($('folder-list').childElementCount, 0);
+            assert.notEqual($('folder-path').textContent, root);
+            $('launch-path').value = child; $('launch-open').click();
+            assert.equal($('folder-browser').hidden, true);
+            $('folder-browse').click();
+            await waitFor(() => $('folder-path').textContent === child);
+            assert.equal($('folder-state').textContent, '子フォルダはありません。');
+        });
+    }
+});
+
+test('folder picker preserves confirmed navigation and ignores responses after typing or launch', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.initialShellPending = true; f.state.launchThread = false;
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const child = join(root, 'child'); await mkdir(child);
+    const { window, $ } = await mount(t, f, true);
+    $('launch-open').click();
+    $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => $('folder-path').textContent === root);
+    assert.equal($('folder-browse').getAttribute('aria-expanded'), 'true');
+    const navigation = holdResponse(window, path => path.startsWith('/api/directories'));
+    const childButton = $('folder-list').querySelector('button');
+    childButton.focus(); childButton.click();
+    await waitFor(() => navigation.seen);
+    assert.equal(childButton.disabled, true);
+    childButton.blur(); // Model browser focus loss when the active button becomes disabled.
+    navigation.release(); await waitFor(() => navigation.consumed);
+    await waitFor(() => $('folder-path').textContent === child);
+    assert.equal(window.document.activeElement, $('folder-path'));
+    assert.match($('folder-state').textContent, /子フォルダはありません/);
+    $('folder-parent').click();
+    await waitFor(() => $('folder-path').textContent === root);
+    await rm(child, { recursive: true });
+    $('folder-list').querySelector('button').click();
+    await waitFor(() => $('folder-state').classList.contains('error'));
+    assert.equal($('folder-path').textContent, root);
+    assert.equal($('folder-list').querySelector('button').textContent, 'child');
+    $('folder-use').click();
+    assert.equal($('launch-path').value, root);
+    assert.equal($('folder-browser').hidden, true);
+    assert.equal(window.document.activeElement.id, 'launch-path');
+
+    const held = holdResponse(window, path => path.startsWith('/api/directories'));
+    $('folder-browse').click(); await waitFor(() => held.seen);
+    $('launch-path').value = child; $('launch-path').dispatchEvent(new window.Event('input'));
+    held.release(); await waitFor(() => held.consumed);
+    assert.equal($('folder-browser').hidden, true);
+    assert.equal($('launch-path').value, child);
+    assert.equal($('folder-path').textContent, root);
+
+    await mkdir(child);
+    $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    $('folder-use').click();
+    $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    const pending = holdResponse(window, path => path.startsWith('/api/directories'));
+    $('folder-list').querySelector('button').click(); await waitFor(() => pending.seen);
+    $('launch-form').dispatchEvent(new window.Event('submit', { cancelable: true }));
+    assert.equal($('folder-browse').disabled, true);
+    assert.equal($('folder-use').disabled, true);
+    pending.release(); await waitFor(() => pending.consumed);
+    await waitFor(() => f.state.creates.length === 1);
+    assert.equal(f.state.creates[0].params.cwd, root);
+    assert.equal($('folder-path').textContent, root);
+    assert.equal($('folder-list').querySelector('button').textContent, 'child');
+    assert.equal($('folder-list').querySelector('button').disabled, true);
 });
 
 test('launch UI prevents repeat requests, recovers by ID and hands off after trust confirmation', async t => {

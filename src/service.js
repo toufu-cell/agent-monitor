@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { realpath, stat, lstat, mkdir, chmod, open, readdir, unlink, utimes } from 'node:fs/promises';
+import { realpath, stat, lstat, mkdir, chmod, open, opendir, readdir, unlink, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import sharp from 'sharp';
 import { isCodexTui, readPresence, originPort } from './presence.js';
@@ -120,7 +120,10 @@ async function directoryPath(value) {
         const path = await realpath(expanded);
         if (!(await stat(path)).isDirectory()) throw new Error();
         return path;
-    } catch { throw new HttpError(400, 'PCにあるディレクトリのパスを入力してください。'); }
+    } catch (error) {
+        if (['EACCES', 'EPERM'].includes(error.code)) throw new HttpError(403, 'ディレクトリを読み取れません。PCでアクセス権を確認してください。');
+        throw new HttpError(400, 'PCにあるディレクトリのパスを入力してください。');
+    }
 }
 
 function isInternal(thread) {
@@ -621,6 +624,33 @@ export class MonitorService {
         })();
         if (wait) await work;
         return record.result;
+    }
+
+    async directories(input) {
+        const path = await directoryPath(input === null ? homedir() : input);
+        const directories = [];
+        let scanned = 0, truncated = false;
+        try {
+            const directory = await opendir(path);
+            try {
+                while (scanned < 2000) {
+                    const entry = await directory.read();
+                    if (!entry) break;
+                    scanned++;
+                    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+                        if (directories.length === 200) { truncated = true; break; }
+                        directories.push({ name: entry.name, path: join(path, entry.name) });
+                    }
+                }
+                if (scanned === 2000) truncated = true;
+            } finally { await directory.close(); }
+        } catch (error) {
+            if (['EACCES', 'EPERM'].includes(error.code)) throw new HttpError(403, 'ディレクトリを読み取れません。PCでアクセス権を確認してください。');
+            throw new HttpError(400, 'ディレクトリを開けません。PCでパスとアクセス権を確認してください。');
+        }
+        directories.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+        const parent = dirname(path);
+        return { path, parent: parent === path ? null : parent, directories, truncated };
     }
 
     async launch(body) {
