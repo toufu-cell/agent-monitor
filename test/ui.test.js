@@ -90,6 +90,10 @@ async function mount(t, f, manualPolling = false, stored = {}, count = 2) {
     window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
     window.HTMLDialogElement.prototype.close = function () { this.open = false; };
     window.confirm = () => true;
+    // jsdom has no layout; Chrome tests verify the actual selection geometry.
+    const screen = $('approval-screen');
+    Object.defineProperties(screen, { clientHeight: { value: 200 }, clientWidth: { value: 280 } });
+    window.Range.prototype.getBoundingClientRect = () => ({ top: 8, bottom: 24, left: 8, right: 200, height: 16 });
     for (const [key, value] of Object.entries(stored)) window.sessionStorage.setItem(key, value);
     if (manualPolling) window.setInterval = () => 0;
     window.eval(await readFile('dist/app.js', 'utf8'));
@@ -900,7 +904,7 @@ test('late operation lookups cannot clear a newer message or terminal submission
 
 test('inline terminal preserves its view, expires input and shares dialog recovery', async t => {
     const f = await fixture(); t.after(() => f.close());
-    f.state.screen = '<button>端末の文字</button>\n❯ 2. 今回だけ許可';
+    f.state.screen = '<button>端末の文字</button>\n  1. 許可\n❯ 2. 今回だけ許可\n     選択中の項目の説明\n  3. 戻る';
     const { window, $ } = await mount(t, f, true);
     window.document.querySelector('.thread-button[data-thread-id="b"]').click();
     await waitFor(() => !$('approval-enter').disabled);
@@ -924,7 +928,7 @@ test('inline terminal preserves its view, expires input and shares dialog recove
     assert.equal(f.state.writes.length, 0);
     window.Date.now = now;
     $('approval-refresh').click(); await waitFor(() => !$('approval-enter').disabled);
-    f.state.screen += '\n端末表示の変更';
+    f.state.screen = f.state.screen.replace('端末の文字', '端末表示の変更');
     $('approval-enter').click();
     await waitFor(() => !$('approval-refresh').disabled);
     assert.deepEqual({ message: $('approval-state').textContent, disabled: $('approval-enter').disabled, dialog: $('terminal-dialog').open }, {
@@ -963,10 +967,40 @@ test('inline terminal preserves its view, expires input and shares dialog recove
     assert.equal($('approval-state').textContent, '');
 });
 
+test('inline terminal blocks missing selection after refresh and keeps dialog input available', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.screen = 'Would you like to run the following command?\n\n› 1. Yes, proceed (y)\n  2. Remember this command (p)\n  3. Cancel (esc)\n\nPress enter to confirm or esc to cancel';
+    const { window, $ } = await mount(t, f, true);
+    window.document.querySelector('.thread-button[data-thread-id="b"]').click();
+    await waitFor(() => !$('approval-enter').disabled);
+    f.state.screen += '\n\n› 承認画面のテストです。\nWould you like to run the following command?\n\n  1. Yes, proceed (y)\n  2. Remember this command (p)\n  3. Cancel (esc)\n\nPress enter to confirm or esc to cancel';
+    const held = holdResponse(window, path => path.includes('/terminal?'));
+    $('approval-refresh').click(); await waitFor(() => held.seen);
+    assert.equal($('approval-enter').disabled, true);
+    held.release(); await waitFor(() => !$('approval-refresh').disabled);
+    assert.equal($('approval-enter').disabled, true);
+    const fetch = window.fetch;
+    let inputRequests = 0;
+    window.fetch = (path, options) => {
+        if (path.endsWith('/terminal-input')) inputRequests++;
+        return fetch(path, options);
+    };
+    $('approval-enter').disabled = false;
+    $('approval-enter').click();
+    assert.equal($('approval-enter').disabled, true);
+    assert.equal(inputRequests, 0);
+    assert.equal(f.state.writes.length, 0);
+    $('approval-terminal').click();
+    await waitFor(() => $('pane-select').value === 'w2:p2');
+    $('bind').click(); await waitFor(() => !$('terminal-send').disabled);
+    assert.equal($('terminal-dialog').open, true);
+});
+
 test('inline terminal retries failed binding and screen reads with bounded requests', async t => {
     for (const endpoint of ['/bind', '/terminal?']) {
         await t.test(endpoint, async t => {
             const f = await fixture(); t.after(() => f.close());
+            f.state.screen = '❯ 1. Yes, proceed (y)';
             const { window, $ } = await mount(t, f, true);
             const original = window.fetch;
             let attempts = 0, requests = 0;
@@ -1004,6 +1038,7 @@ test('inline terminal retries failed binding and screen reads with bounded reque
 
 test('inline terminal hides on ambiguous mapping, thread switch and loss of trusted state', async t => {
     const f = await fixture(); t.after(() => f.close());
+    f.state.screen = '❯ 1. Yes, proceed (y)';
     const { window, $ } = await mount(t, f, true);
     const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
     select('b'); await waitFor(() => !$('approval-enter').disabled);

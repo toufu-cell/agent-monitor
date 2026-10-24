@@ -793,6 +793,45 @@ async function syncApproval() {
     } finally { approvalChecking = false; }
 }
 
+function lastApprovalSelection(text) {
+    let block = [], adjacent = false, offset = 0;
+    for (const rawLine of text.split('\n')) {
+        const line = rawLine.replace(/\r$/, '');
+        const match = /^[\t ]*(?:([›❯])[\t ]+)?(\d+)\.[\t ]+(\S.*)$/.exec(line);
+        if (match) {
+            const option = { start: offset, end: offset + line.length, number: Number(match[2]),
+                marked: Boolean(match[1]), indent: match[0].length - match[3].length };
+            if (!adjacent || option.number !== block.at(-1)?.number + 1) block = [];
+            block.push(option);
+            adjacent = true;
+        } else if (adjacent && line.trim() && /^[\t ]*/.exec(line)[0].length >= block.at(-1).indent) {
+            block.at(-1).end = offset + line.length;
+        } else {
+            adjacent = false;
+            if (line.trim() && line.trim() !== 'Press enter to confirm or esc to cancel') block = [];
+        }
+        offset += rawLine.length + 1;
+    }
+    const marked = block.filter(option => option.marked);
+    return block[0]?.number === 1 && marked.length === 1 ? marked[0] : null;
+}
+
+function approvalSelectionVisible(align = false) {
+    const screen = $('approval-screen'), range = terminalView?.selection;
+    if (!range || !screen.clientHeight) return false;
+    const top = screen.getBoundingClientRect().top + screen.clientTop;
+    const bottom = top + screen.clientHeight;
+    let rect = range.getBoundingClientRect();
+    if (align) {
+        // Keep a pixel inside the viewport when scrollTop rounds fractional coordinates.
+        screen.scrollTop += rect.top < top + 1 ? rect.top - top - 1 : rect.bottom > bottom - 1 ? rect.bottom - bottom + 1 : 0;
+        rect = range.getBoundingClientRect();
+    }
+    const left = screen.getBoundingClientRect().left + screen.clientLeft;
+    return rect.height > 0 && rect.top >= top && rect.bottom <= bottom
+        && rect.left >= left && rect.right <= left + screen.clientWidth;
+}
+
 function terminalControls() {
     const bound = terminalBinding && $('terminal-dialog').open && terminalBinding.paneId === $('pane-select').value;
     const ready = bound && terminalView && !terminalBusy && !pending.terminal;
@@ -802,7 +841,6 @@ function terminalControls() {
     $('terminal-resolve').hidden = pending.terminal?.state !== 'unknown';
     const card = terminalSurface === 'card' && !$('approval-card').hidden;
     const fresh = terminalView && Date.now() - terminalView.at < 25000;
-    $('approval-enter').disabled = !card || !fresh || terminalBusy || Boolean(pending.terminal) || !approvalEligible();
     $('approval-refresh').disabled = !card || terminalBusy || Boolean(pending.terminal);
     renderTerminalButtons();
     if (card) {
@@ -811,8 +849,11 @@ function terminalControls() {
             : terminalBinding?.inputError ? terminalBinding.inputError
             : !terminalView ? '会話の状態を確認中です。再操作には表示を更新してください。'
             : !fresh ? '表示が古くなりました。更新して選択中の項目を確認してください。'
-            : `${terminalBinding.paneId} · 端末の選択中の項目を確認してください。`;
+            : !terminalView.selection ? '選択中の項目を確認できません。更新するか、端末を開いて確認してください。'
+            : !approvalSelectionVisible() ? '選択中の項目が表示外です。表示を戻すか、端末を開いて確認してください。'
+            : `${terminalBinding.paneId} · 選択中の項目を確認してください。`;
     }
+    $('approval-enter').disabled = !card || !fresh || terminalBusy || Boolean(pending.terminal) || !approvalEligible() || !approvalSelectionVisible();
 }
 
 function currentTerminal(request, paneId) {
@@ -928,7 +969,6 @@ async function refreshTerminal() {
             clearTimeout(approvalExpiry);
             approvalExpiry = setTimeout(terminalControls, Math.max(0, 25000 - (Date.now() - at)));
         }
-        screen.scrollTop = card || atBottom ? screen.scrollHeight : scroll;
         $('terminal-state').textContent = `${view.paneId} · ${binding.resource === 'launches' ? '起動したCodexで確認済み。' : '会話IDで関連付け済み。'}`;
     } catch (error) {
         if (card && currentTerminal(request, binding.paneId) && terminalBinding === binding) {
@@ -938,8 +978,21 @@ async function refreshTerminal() {
     }
     finally {
         if (request === terminalRequest && terminalBinding === binding) {
-            terminalBusy = false; terminalControls();
-            if (card) screen.scrollTop = screen.scrollHeight;
+            terminalBusy = false;
+            if (card && terminalView) {
+                const selection = lastApprovalSelection(screen.textContent);
+                if (selection) {
+                    const range = document.createRange();
+                    range.setStart(screen.firstChild, selection.start);
+                    range.setEnd(screen.firstChild, selection.end);
+                    terminalView.selection = range;
+                }
+                // Render the status before alignment, then recheck input against the positioned selection.
+                terminalControls();
+                if (selection) approvalSelectionVisible(true);
+                else screen.scrollTop = screen.scrollHeight;
+            } else if (!card) screen.scrollTop = atBottom ? screen.scrollHeight : scroll;
+            terminalControls();
         }
     }
 }
@@ -948,7 +1001,7 @@ async function terminalInput(key) {
     const binding = terminalBinding, view = terminalView;
     if (!binding || !view || !currentTerminal(terminalRequest, binding.paneId) || terminalBusy || pending.terminal) return;
     const card = terminalSurface === 'card';
-    if (card && (key !== 'Enter' || Date.now() - view.at >= 25000)) { terminalControls(); return; }
+    if (card && (key !== 'Enter' || Date.now() - view.at >= 25000 || !approvalSelectionVisible())) { terminalControls(); return; }
     if (key === 'Ctrl-C' && !window.confirm(`${binding.paneId}へCtrl-Cを送信して処理を中断しますか？`)) return;
     const body = { requestId: requestId(), bindingId: binding.bindingId, viewId: view.viewId,
         ...(key ? { key, confirmInterrupt: key === 'Ctrl-C' } : { text: $('terminal-text').value }) };
@@ -1021,6 +1074,8 @@ $('composer-terminal').addEventListener('click', openTerminal);
 $('approval-terminal').addEventListener('click', openTerminal);
 $('approval-refresh').addEventListener('click', refreshTerminal);
 $('approval-enter').addEventListener('click', () => terminalInput('Enter'));
+$('approval-screen').addEventListener('scroll', terminalControls);
+window.addEventListener('resize', terminalControls);
 $('terminal-close').addEventListener('click', closeTerminal);
 $('terminal-dialog').addEventListener('cancel', event => { event.preventDefault(); closeTerminal(); });
 $('bind').addEventListener('click', bindTerminal);
