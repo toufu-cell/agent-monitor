@@ -1075,11 +1075,12 @@ export class MonitorService {
         return { pane, fingerprint: processFingerprint(pane, process, [owner, id]) };
     }
 
-    async bind(id, paneId, owner = 'thread') {
+    async bind(id, paneId, owner = 'thread', purpose = 'terminal') {
         requireString(paneId);
+        if (!['terminal', 'approval'].includes(purpose) || (purpose === 'approval' && owner !== 'thread')) throw new HttpError(400, '端末操作の用途を確認してください。');
         const identity = await this.identity(id, paneId, owner);
         const bindingId = randomUUID();
-        this.bindings.set(bindingId, { owner, id, paneId, fingerprint: identity.fingerprint, expires: Date.now() + 30 * 60 * 1000 });
+        this.bindings.set(bindingId, { owner, id, paneId, purpose, fingerprint: identity.fingerprint, expires: Date.now() + 30 * 60 * 1000 });
         return { bindingId, paneId };
     }
 
@@ -1093,7 +1094,17 @@ export class MonitorService {
         const binding = this.bindings.get(bindingId);
         if (!binding || binding.owner !== owner || binding.id !== id || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
         try {
-            const identity = await this.identity(id, binding.paneId, owner);
+            let sources;
+            if (binding.purpose === 'approval') {
+                sources = await this.sources(false, { fresh: true });
+                const thread = await this.thread(id, sources);
+                const panes = sources.panes.filter(pane => pane.threadId === id);
+                if (thread.provider !== 'codex' || thread.status.type !== 'active' || !thread.status.activeFlags?.includes('waitingOnApproval')
+                    || panes.length !== 1 || panes[0].pane_id !== binding.paneId) {
+                    throw new HttpError(409, '承認待ちの状態か対応する端末が変わりました。表示を更新してください。');
+                }
+            }
+            const identity = await this.identity(id, binding.paneId, owner, sources);
             if (identity.fingerprint !== binding.fingerprint) throw new HttpError(409, '端末の対象が変わりました。選び直してください。');
             if (claudeSnapshot && ((identity.pane.agent_session?.value || null) !== claudeSnapshot.hookSession
                 || !claudeLaunchSessionsMatch(identity.pane, identity.process, claudeSnapshot.sessions))) {
@@ -1103,6 +1114,7 @@ export class MonitorService {
             }
             return binding;
         } catch (error) {
+            binding.view = null;
             this.bindings.delete(bindingId);
             throw error;
         }
@@ -1159,9 +1171,12 @@ export class MonitorService {
         return this.once(body.requestId, JSON.stringify(['terminal', owner, id, body.bindingId, body.text, body.key]), async () => {
             const binding = await this.binding(id, body.bindingId, owner);
             return this.paneInput(binding.paneId, async () => {
+                const approval = binding.purpose === 'approval';
+                const lifetime = approval ? 25000 : 30000;
+                if (approval && (hasText || body.key !== 'Enter')) throw new HttpError(409, '承認カードでは選択中の項目にEnterを送信できます。');
                 const claudeLaunch = owner === 'launch' && this.getLaunch(id).provider === 'claude';
                 if (claudeLaunch) await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId);
-                if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
+                if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at >= lifetime) throw new HttpError(409, '端末表示を更新してから操作してください。');
                 const { read } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
                 if (createHash('sha256').update(read.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
                 const claudeSnapshot = claudeLaunch ? await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId) : null;
@@ -1170,11 +1185,14 @@ export class MonitorService {
                 await this.binding(id, body.bindingId, owner, claudeSnapshot);
                 if (this.bindings.get(body.bindingId) !== binding || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
                 if (owner === 'launch' && this.getLaunch(id).state !== 'waiting') throw new HttpError(409, '起動状態を更新して端末を選び直してください。');
-                if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
+                if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at >= lifetime) throw new HttpError(409, '端末表示を更新してから操作してください。');
                 if (createHash('sha256').update(latestRead.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
                 binding.view = null;
                 const key = body.key === 'Ctrl-C' ? 'ctrl+c' : body.key;
                 return this.herdr.call('pane.send_input', { pane_id: binding.paneId, ...(hasText ? { text: body.text } : { keys: [key] }) });
+            }).catch(error => {
+                if (binding.purpose === 'approval') binding.view = null;
+                throw error;
             });
         });
     }

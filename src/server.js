@@ -120,7 +120,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     if (action === 'send') return json(200, await service.send(id, body));
                     if (action === 'answer') return json(200, await service.answer(id, body));
                     if (action === 'answer-recover') return json(200, await service.recoverAnswer(id, body));
-                    if (action === 'bind') return json(200, await service.bind(id, body.paneId));
+                    if (action === 'bind') return json(200, await service.bind(id, body.paneId, 'thread', body.purpose));
                     if (action === 'unbind') return json(200, service.unbind(id, body.bindingId));
                     if (action === 'terminal-input') return json(200, await service.terminalInput(id, body));
                 }

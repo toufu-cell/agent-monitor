@@ -9,6 +9,74 @@ import { chromium } from 'playwright';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
 
+test('320px inline terminal keeps the selected option and Enter visible', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const turn = f.state.turns.get('b').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = Date.now() / 1000 - 120;
+    const selectedOption = '› 1. Yes, proceed (y)';
+    f.state.screen = ['› 承認画面のテストです。選択中の項目を確認してください。',
+        '❯ 1. 過去の選択', ...Array.from({ length: 30 }, (_, i) => `端末の表示 ${i}`),
+        'Would you like to run the following command?', '',
+        selectedOption, `  2. Yes, and don't ask again for commands that start with ${'a long command argument '.repeat(10)} (p)`, '  3. No, and tell Codex what to do differently (esc)', '',
+        'Press enter to confirm or esc to cancel'].join('\n');
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 320, height: 640 }, isMobile: true, hasTouch: true });
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="b"]').click();
+    const readLayout = () => page.evaluate(selectedOption => {
+        const card = document.getElementById('approval-card'), screen = document.getElementById('approval-screen');
+        const enter = document.getElementById('approval-enter').getBoundingClientRect();
+        const preview = screen.getBoundingClientRect(), draft = document.getElementById('draft').getBoundingClientRect();
+        const header = document.querySelector('.conversation-header').getBoundingClientRect();
+        const changes = document.getElementById('changes-open').getBoundingClientRect();
+        const progress = document.getElementById('progress-line').getBoundingClientRect();
+        const reading = document.getElementById('reading-line').getBoundingClientRect();
+        const range = document.createRange(), start = screen.textContent.indexOf(selectedOption);
+        range.setStart(screen.firstChild, start); range.setEnd(screen.firstChild, start + selectedOption.length);
+        const option = range.getBoundingClientRect();
+        return { width: document.documentElement.scrollWidth, height: card.getBoundingClientRect().height,
+            pageScroll: scrollY,
+            optionVisible: option.top >= preview.top && option.bottom <= preview.bottom,
+            draftVisible: draft.height >= 44 && draft.top >= 0 && draft.bottom <= innerHeight,
+            changesVisible: changes.top >= header.top && changes.bottom <= header.bottom && changes.left >= 0 && changes.right <= innerWidth,
+            progressVisible: progress.height > 0 && progress.top >= header.bottom && progress.bottom <= reading.top,
+            enterHeight: enter.height, enterBottom: enter.bottom };
+    }, selectedOption);
+    await page.waitForFunction(() => !document.getElementById('approval-enter').disabled);
+    assert.equal(await page.locator('#changes-open').isVisible(), true);
+    await page.locator('#progress-line').waitFor({ state: 'visible' });
+    assert.match(await page.locator('#elapsed').textContent(), /指示から\d+分経過/);
+    await page.locator('#draft').fill('承認後に送る下書き');
+    const layout = await readLayout();
+    assert(layout.width <= 320); assert(layout.height <= 640 * .55 + 1);
+    assert(layout.optionVisible); assert(layout.draftVisible);
+    assert(layout.changesVisible); assert(layout.progressVisible);
+    assert.equal(layout.pageScroll, 0);
+    assert(layout.enterHeight >= 44); assert(layout.enterBottom <= 640);
+    assert.equal(await page.locator('#terminal-open').isVisible(), false);
+    assert.equal(await page.locator('#composer-terminal').isVisible(), false);
+    await mkdir('artifacts', { recursive: true });
+    await page.screenshot({ path: 'artifacts/mobile-approval-320.png', fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator('#approval-refresh').click();
+    await page.waitForFunction(() => !document.getElementById('approval-enter').disabled);
+    const wideLayout = await readLayout();
+    assert(wideLayout.optionVisible); assert(wideLayout.draftVisible);
+    assert(wideLayout.changesVisible); assert(wideLayout.progressVisible);
+    await page.screenshot({ path: 'artifacts/mobile-approval-390.png', fullPage: true });
+    await page.locator('#approval-enter').click();
+    await page.waitForFunction(() => document.getElementById('approval-enter').disabled && !document.getElementById('approval-refresh').disabled);
+    assert.deepEqual(f.state.writes, [{ pane_id: 'w2:p2', keys: ['Enter'] }]);
+    assert.equal(await page.locator('#draft').inputValue(), '承認後に送る下書き');
+    f.state.screen = `❯ 1. ${'A selected option too long to display in the card. '.repeat(100)}`;
+    await page.locator('#approval-refresh').click();
+    await page.waitForFunction(() => !document.getElementById('approval-refresh').disabled);
+    assert.equal(await page.locator('#approval-enter').isDisabled(), true);
+    await page.locator('#approval-enter').dispatchEvent('click');
+    assert.equal(f.state.writes.length, 1);
+});
+
 test('active progress keeps elapsed text visible at 320px', async t => {
     const f = await fixture(); t.after(() => f.close());
     const turn = f.state.turns.get('a').at(-1);
@@ -360,7 +428,7 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     await page.getByText('別の会話の出力です。', { exact: true }).waitFor();
     assert.equal(await page.getByText('新着の出力です。', { exact: true }).count(), 0);
     assert.equal(await page.locator('#send').isDisabled(), true);
-    await page.locator('#composer-terminal').click();
+    await page.locator('#approval-terminal').click();
     await page.waitForFunction(() => document.getElementById('pane-select').value === 'w2:p2');
     assert.equal(await page.locator('#pane-select').inputValue(), 'w2:p2');
     await page.locator('#terminal-close').click();

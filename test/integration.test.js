@@ -1224,6 +1224,37 @@ test('terminal identity, per-action approval, validation and deduplication throu
     assert.equal((await request(`/api/threads/a/terminal?bindingId=${binding.bindingId}`)).status, 409);
 });
 
+test('approval Enter rejects new terminal candidates or cleared waiting state after the view', async t => {
+    for (const change of ['candidate', 'waiting']) await t.test(change, async t => {
+        const f = await fixture(); t.after(() => f.close());
+        const { request, state } = f;
+        await request('/api/threads');
+        const base = '/api/threads/b';
+        const binding = (await request(`${base}/bind`, { paneId: 'w2:p2', purpose: 'approval' })).body;
+        const view = (await request(`${base}/terminal?bindingId=${binding.bindingId}`)).body;
+        const gate = { paneId: 'w2:p2', ...Promise.withResolvers(), entered: Promise.withResolvers() };
+        state.readGate = gate;
+        const body = { requestId: `approval_${change}_1234567890`, bindingId: binding.bindingId, viewId: view.viewId, key: 'Enter' };
+        const sending = request(`${base}/terminal-input`, body);
+        await gate.entered.promise;
+        if (change === 'candidate') {
+            state.panes.push({ ...state.panes[1], pane_id: 'w3:p3', terminal_id: 'term3', tab_id: 'tab3', workspace_id: 'w3' });
+            state.processes.set('w3:p3', structuredClone(state.processes.get('w2:p2')));
+        } else {
+            state.threads.get('b').status = { type: 'active', activeFlags: [] };
+            state.panes[1].agent_status = 'working';
+        }
+        gate.resolve();
+        assert.equal((await sending).body.state, 'failed');
+        assert.deepEqual(state.writes, []);
+        if (change === 'candidate') state.panes.pop();
+        else { state.threads.get('b').status.activeFlags = ['waitingOnApproval']; state.panes[1].agent_status = 'blocked'; }
+        const stale = await request(`${base}/terminal-input`, { ...body, requestId: `approval_stale_${change}_1234567890` });
+        assert.equal(stale.body.state, 'failed');
+        assert.deepEqual(state.writes, []);
+    });
+});
+
 test('Herdr discovers embedded CLI sessions and shared queue survives HTTP disconnect', async t => {
     const f = await fixture(); t.after(() => f.close());
     const { request, state } = f;

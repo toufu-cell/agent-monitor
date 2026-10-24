@@ -58,15 +58,15 @@ textarea { resize: vertical; width: 100%; max-height: 30dvh; line-height: 1.6; }
 .pin { align-self: start; color: var(--muted); text-align: center !important; font-size: 20px; }
 .pin[aria-pressed="true"] { color: var(--active); }
 #conversation { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
-.conversation-header { display: flex; gap: 14px; align-items: center; min-height: 80px; padding: 12px 25px; border-bottom: 1px solid #e3e8ee; }
+.conversation-header { display: flex; flex-shrink: 0; gap: 14px; align-items: center; min-height: 80px; padding: 12px 25px; border-bottom: 1px solid #e3e8ee; }
 .heading { min-width: 0; flex: 1; }
 h1 { font-size: 17px; margin: 0 0 6px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #project { color: var(--muted); font-size: 12px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status { font-size: 12px; white-space: nowrap; }
-#progress-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 7px 25px; color: var(--muted); font-size: 12px; border-bottom: 1px solid #e3e8ee; }
+#progress-line { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 7px 25px; color: var(--muted); font-size: 12px; border-bottom: 1px solid #e3e8ee; }
 #stage { overflow-wrap: anywhere; }
 #elapsed { white-space: nowrap; font-variant-numeric: tabular-nums; }
-#reading-line { min-height: 44px; padding: 0 25px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; background: var(--paper); }
+#reading-line { min-height: 44px; flex-shrink: 0; padding: 0 25px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; background: var(--paper); }
 #latest { border: 0; color: var(--active); font-weight: 600; background: transparent; }
 #history { overflow-y: auto; flex: 1; min-height: 0; overscroll-behavior: contain; padding: 22px max(25px, calc((100% - 820px) / 2)); overflow-anchor: none; }
 #older { display: block; margin: 0 auto 25px; color: var(--active); }
@@ -91,6 +91,11 @@ details pre { margin: 0; max-height: 400px; border-radius: 0; }
 .tool-entry + .tool-entry { border-top: 1px solid #dce3ea; }
 .tool-label { font-family: SFMono-Regular, Menlo, monospace; font-size: 12px; padding: 10px 12px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 #composer-terminal { margin-bottom: 8px; color: var(--active); }
+#approval-card { flex: 0 1 auto; min-height: 0; max-height: 35dvh; min-width: 0; display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; border-top: 1px solid #dce3ea; background: var(--paper); }
+#approval-state { margin: 0; flex-shrink: 0; overflow-wrap: anywhere; }
+#approval-screen { margin: 0; min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #202c38; color: #eef2f7; padding: 8px; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; }
+.approval-actions button { font-size: 12px; padding: 6px 8px; min-height: 44px; }
 #questions { flex: 0 1 auto; max-height: 35dvh; overflow-y: auto; overscroll-behavior: contain; border-top: 1px solid #dce3ea; padding: 12px max(25px, calc((100% - 820px) / 2)); background: var(--paper); }
 .question + .question { border-top: 1px solid #cbd4de; margin-top: 16px; padding-top: 16px; }
 .question-title, .history-question { line-height: 1.75; overflow-wrap: anywhere; }
@@ -157,7 +162,11 @@ dialog select, #terminal-text { width: 100%; margin-bottom: 8px; }
     #progress-line { padding: 7px 16px; }
     #history { padding: 18px 16px; }
     #composer { padding: 10px 12px max(10px, env(safe-area-inset-bottom)); }
+    #approval-card { max-height: 55dvh; }
+    .approval-visible #draft { height: 68px; }
+    .approval-visible #send:disabled, .approval-visible .composer-actions span { display: none; }
     #questions { padding: 10px 12px; }
     #draft, #launch-path, #launch-provider, .question textarea { font-size: 16px; }
+    .composer-actions { flex-wrap: wrap; }
     .brand { padding-bottom: 18px; }
 }
