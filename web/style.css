@@ -28,17 +28,32 @@ textarea { resize: vertical; width: 100%; max-height: 30dvh; line-height: 1.6; }
 .notification-actions button { font-size: 13px; }
 #launch-dialog { max-width: 560px; }
 #launch-path { width: 100%; }
+#folder-browse { margin-top: 8px; }
+#folder-browser { border-top: 1px solid #dce3ea; margin-top: 12px; padding-top: 4px; }
+#folder-path { font-size: 13px; overflow-wrap: anywhere; }
+.folder-search { display: flex; gap: 8px; margin: 8px 0; }
+#folder-search { flex: 1; min-width: 0; width: 100%; }
+.folder-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.folder-actions button { flex: 1 1 150px; }
+#folder-list { display: grid; gap: 6px; max-height: 30dvh; overflow-y: auto; padding: 4px; }
+#folder-list button { width: 100%; text-align: left; overflow-wrap: anywhere; min-width: 0; }
 #launch-help, #launch-state { overflow-wrap: anywhere; }
 #thread-list { overflow-y: auto; margin: 0 -16px; padding: 0 10px 30px; }
 .project-group { font-size: 12px; color: var(--muted); margin: 24px 10px 8px; overflow-wrap: anywhere; }
+.project-group.attention-heading { color: var(--attention); font-size: 14px; font-weight: 700; }
 .thread-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px; margin: 5px 0; border-left: 3px solid transparent; border-radius: 3px; }
+.thread-row.attention { border-left-color: var(--attention); background: #fbf5e9; }
 .thread-row.selected { border-left-color: var(--active); background: #e8eff6; }
+.thread-row.attention.selected { border-left-color: var(--attention); }
 .thread-row button { background: transparent; border: 0; text-align: left; border-radius: 3px; }
+.thread-row.attention:not(.selected) .thread-button:hover:enabled { background: #fbf5e9; }
 .thread-row .thread-button { padding: 10px 7px; display: grid; gap: 7px; width: 100%; }
 .thread-title, .thread-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-title { font-weight: 600; font-size: 14px; }
 .thread-preview, .thread-meta { font-size: 12px; color: var(--muted); }
 .thread-meta { display: flex; justify-content: space-between; gap: 8px; }
+.thread-row.attention .thread-meta > span:first-child { color: var(--attention); font-weight: 650; }
+.thread-row.attention.selected .thread-meta > span:first-child { color: #8a5a00; }
 .pin { align-self: start; color: var(--muted); text-align: center !important; font-size: 20px; }
 .pin[aria-pressed="true"] { color: var(--active); }
 #conversation { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
