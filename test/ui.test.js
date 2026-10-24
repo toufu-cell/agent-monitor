@@ -520,6 +520,14 @@ test('active progress uses confirmed Codex turns and hides uncertain elapsed tim
     turn.status = 'inProgress';
     await refresh(); assert.equal($('status').textContent, '承認・回答待ち'); assert.equal($('elapsed').hidden, false);
     assert.equal($('stage').textContent, ''); assert.equal($('stage').hidden, true);
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    turn.items.push({ id: 'additional-instruction', type: 'userMessage', content: [{ type: 'text', text: '追加の指示' }] });
+    turn.items.find(item => item.type === 'commandExecution').status = 'inProgress';
+    await refresh();
+    assert.equal($('progress-line').hidden, false);
+    assert.equal($('elapsed').hidden, true); assert.equal($('elapsed').textContent, '');
+    assert.equal($('stage').hidden, false); assert.equal($('stage').textContent, 'ツール実行中');
     f.state.failHistory = true;
     window.document.dispatchEvent(new window.Event('visibilitychange'));
     await waitFor(() => $('history-notice').classList.contains('error'));
@@ -532,124 +540,103 @@ test('active progress uses confirmed Codex turns and hides uncertain elapsed tim
     assert.equal($('progress-line').hidden, true);
 });
 
-test('Claude progress accepts initial active history and waits for a new instruction after idle', async t => {
-    const f = await fixture(); t.after(() => f.close());
-    const c = await f.addClaude(true);
-    const timestamp = new Date(1800000000000).toISOString();
-    await c.write([c.row('user', '最初の指示', { timestamp }), c.row('assistant', [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: {} }])]);
-    c.session.status = 'busy'; f.state.ansiScreen = '';
-    const { window, $ } = await mount(t, f, true, {}, 1);
-    window.Date.now = () => 1800000120000;
-    window.document.querySelector('.thread-button').click();
-    await waitFor(() => !$('progress-line').hidden);
-    assert.equal($('elapsed').textContent, '指示から2分経過');
-    assert.equal($('stage').textContent, 'ツール実行中');
-    c.session.status = 'idle';
-    const pollUntil = check => waitFor(() => { window.document.dispatchEvent(new window.Event('visibilitychange')); return check(); });
-    await pollUntil(() => $('status').textContent === '待機中');
-    assert.equal($('progress-line').hidden, true);
-    c.session.status = 'busy';
-    await pollUntil(() => $('status').textContent === '作業中');
+function assertClaudeProgress($, visible) {
+    assert.equal($('progress-line').hidden, !visible);
+    assert.equal($('stage').hidden, !visible);
+    assert.equal($('stage').textContent, visible ? '作業中' : '');
     assert.equal($('elapsed').hidden, true);
-    assert.equal($('stage').textContent, '作業中');
-    await c.append([c.row('user', '次の指示', { timestamp: new Date(1800000060000).toISOString() })]);
-    await pollUntil(() => $('turns').textContent.includes('次の指示'));
-    assert.equal($('elapsed').textContent, '指示から1分経過');
-    assert.equal($('elapsed').hidden, false);
-});
+    assert.equal($('elapsed').textContent, '');
+}
 
-test('Claude progress accepts the first or next instruction in either state and history order', async t => {
-    for (const hasHistory of [false, true]) {
-        for (const historyFirst of [false, true]) {
-            await t.test(`${hasHistory ? 'next' : 'first'} instruction, ${historyFirst ? 'history' : 'state'} first`, async t => {
-                const f = await fixture(); t.after(() => f.close());
-                const c = await f.addClaude(true);
-                await c.write(hasHistory ? [c.row('user', '前の指示')] : []);
-                const { window, $ } = await mount(t, f, true, {}, 1);
-                window.Date.now = () => 1800000120000;
-                const pollUntil = check => waitFor(() => { window.document.dispatchEvent(new window.Event('visibilitychange')); return check(); });
-                window.document.querySelector('.thread-button').click();
-                await pollUntil(() => $('status').textContent === '待機中' && $('history-notice').textContent !== '履歴を読み込んでいます…');
-                const appendInstruction = () => c.append([c.row('user', '新しい指示', { timestamp: new Date(1800000060000).toISOString() })]);
-                if (historyFirst) {
-                    await appendInstruction();
-                    await pollUntil(() => $('turns').textContent.includes('新しい指示'));
-                    assert.equal($('progress-line').hidden, true);
-                }
-                c.session.status = 'busy'; f.state.ansiScreen = '';
-                await pollUntil(() => $('status').textContent === '作業中');
-                if (!historyFirst) {
-                    assert.equal($('elapsed').hidden, true);
-                    await appendInstruction();
-                    await pollUntil(() => $('turns').textContent.includes('新しい指示'));
-                }
-                assert.equal($('elapsed').hidden, false);
-                assert.equal($('elapsed').textContent, '指示から1分経過');
-            });
-        }
-    }
-});
-
-test('Claude progress uses the completed turn first received with idle as its stale baseline', async t => {
+test('Claude progress uses active state before history and clears elapsed when switching from Codex', async t => {
     const f = await fixture(); t.after(() => f.close());
-    const c = await f.addClaude(true);
-    await c.write([c.row('user', '指示A')]);
+    const turn = f.state.turns.get('a').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = 1800000000;
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    const c = await f.addClaude();
+    await c.write([c.row('user', '古い指示'), c.row('assistant', [{ type: 'tool_use', id: 'old-tool', name: 'Read', input: {} }])]);
     c.session.status = 'busy'; f.state.ansiScreen = '';
-    const { window, $ } = await mount(t, f, true, {}, 1);
+    const { window, $ } = await mount(t, f, true, {}, 3);
     window.Date.now = () => 1800000120000;
-    const fetch = window.fetch;
-    let status = 'active';
-    window.fetch = async (path, options) => {
-        const response = await fetch(path, options);
-        if (!path.endsWith('/state')) return response;
-        const value = await response.json();
-        value.thread.status = { type: status, activeFlags: [] };
-        return new Response(JSON.stringify(value), { status: response.status });
-    };
+    window.document.querySelector('[data-thread-id="a"]').click();
+    await waitFor(() => $('elapsed').textContent === '指示から2分経過');
+    assert.equal($('elapsed').textContent, '指示から2分経過');
+    const history = holdResponse(window, path => path.startsWith('/api/threads/' + encodeURIComponent(c.id) + '/history'));
+    window.document.querySelector(`[data-thread-id="${c.id}"]`).click();
+    assertClaudeProgress($, false);
+    await waitFor(() => history.seen && !$('progress-line').hidden);
+    assert.equal(history.consumed, false);
+    assert.equal($('status').textContent, '作業中');
+    assertClaudeProgress($, true);
+    history.release();
+    await waitFor(() => $('turns').textContent.includes('古い指示'));
+    assert.match($('turns').textContent, /Read/);
+    assertClaudeProgress($, true);
     const pollUntil = check => waitFor(() => {
         if (check()) return true;
         window.document.dispatchEvent(new window.Event('visibilitychange')); return false;
     });
-    window.document.querySelector('.thread-button').click();
-    await pollUntil(() => !$('progress-line').hidden);
-    status = 'idle';
-    await c.append([c.row('user', '完了した指示B', { timestamp: new Date(1800000000000).toISOString() })]);
-    await pollUntil(() => $('status').textContent === '待機中' && $('turns').textContent.includes('完了した指示B'));
-    status = 'active';
+    c.session.status = 'waiting'; c.session.waitingFor = 'input needed';
+    await pollUntil(() => $('status').textContent === '承認・回答待ち');
+    assertClaudeProgress($, false);
+    c.session.status = 'idle'; delete c.session.waitingFor;
+    await pollUntil(() => $('status').textContent === '待機中');
+    assertClaudeProgress($, false);
+    c.session.status = 'busy';
     await pollUntil(() => $('status').textContent === '作業中');
-    assert.equal($('elapsed').hidden, true);
-    await c.append([c.row('user', '新しい指示C', { timestamp: new Date(1800000060000).toISOString() })]);
-    await pollUntil(() => $('turns').textContent.includes('新しい指示C'));
-    assert.equal($('elapsed').hidden, false);
-    assert.equal($('elapsed').textContent, '指示から1分経過');
+    assertClaudeProgress($, true);
 });
 
-test('Claude progress recovers a failed initial idle history without timing an unconfirmed old turn', async t => {
+test('Claude progress handles failed history, failed state, stale generations and closure', async t => {
     const f = await fixture(); t.after(() => f.close());
-    const c = await f.addClaude(true);
-    await c.write([c.row('user', '復旧時の旧指示', { timestamp: new Date(1800000000000).toISOString() })]);
-    const { window, $ } = await mount(t, f, true, {}, 1);
-    window.Date.now = () => 1800000120000;
+    const c = await f.addClaude();
+    await c.write([c.row('user', 'Claudeの履歴')]);
+    c.session.status = 'busy'; f.state.ansiScreen = '';
+    const { window, $ } = await mount(t, f, true, {}, 3);
+    const base = '/api/threads/' + encodeURIComponent(c.id);
     const fetch = window.fetch;
-    let failHistory = true;
-    window.fetch = (path, options) => failHistory && path.includes('/history')
+    let failState = false, failHistory = true;
+    window.fetch = (path, options) => path === base + '/state' && failState
+        ? Promise.resolve(new Response(JSON.stringify({ error: '状態取得エラー' }), { status: 503 }))
+        : path.startsWith(base + '/history') && failHistory
         ? Promise.resolve(new Response(JSON.stringify({ error: '履歴取得エラー' }), { status: 503 })) : fetch(path, options);
     const pollUntil = check => waitFor(() => {
         if (check()) return true;
         window.document.dispatchEvent(new window.Event('visibilitychange')); return false;
     });
-    window.document.querySelector('.thread-button').click();
-    await pollUntil(() => $('status').textContent === '待機中' && $('history-notice').classList.contains('error'));
-    c.session.status = 'busy'; f.state.ansiScreen = '';
-    await pollUntil(() => $('status').textContent === '作業中');
-    assert.equal($('progress-line').hidden, true);
-    failHistory = false;
-    await pollUntil(() => $('turns').textContent.includes('復旧時の旧指示'));
-    assert.equal($('elapsed').hidden, true);
-    await c.append([c.row('user', '復旧後の新しい指示', { timestamp: new Date(1800000060000).toISOString() })]);
-    await pollUntil(() => $('turns').textContent.includes('復旧後の新しい指示'));
-    assert.equal($('elapsed').hidden, false);
-    assert.equal($('elapsed').textContent, '指示から1分経過');
+    const select = id => window.document.querySelector(`[data-thread-id="${id}"]`).click();
+    select(c.id);
+    await waitFor(() => $('history-notice').textContent.includes('履歴取得エラー'));
+    assertClaudeProgress($, true);
+    failHistory = false; failState = true;
+    const history = holdResponse(window, path => path.startsWith(base + '/history'));
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => history.seen && $('progress-line').hidden);
+    assert.equal(history.consumed, false);
+    assert.equal($('status').textContent, '状態未確認');
+    assertClaudeProgress($, false);
+    history.release();
+    await waitFor(() => $('history-notice').textContent.includes('状態取得エラー'));
+    assertClaudeProgress($, false);
+    failState = false;
+    await pollUntil(() => !$('progress-line').hidden && $('history-notice').hidden);
+    assertClaudeProgress($, true);
+    const state = holdResponse(window, path => path === base + '/state');
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => state.seen);
+    select('a');
+    await waitFor(() => $('send-state').textContent.includes('待機中のPC'));
+    select(c.id);
+    assertClaudeProgress($, false);
+    state.release();
+    await waitFor(() => state.consumed);
+    assertClaudeProgress($, false);
+    await pollUntil(() => !$('progress-line').hidden);
+    assertClaudeProgress($, true);
+    f.state.panes = f.state.panes.filter(pane => pane.pane_id !== c.pane.pane_id);
+    await pollUntil(() => $('status').textContent === '終了');
+    assertClaudeProgress($, false);
 });
 
 test('Claude shares the conversation composer and retains drafts while awaiting input', async t => {

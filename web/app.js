@@ -453,7 +453,7 @@ function renderComposer() {
     const operation = pending[selected];
     const image = images.get(selected);
     const missingImage = imageDrafts[selected] && !image;
-    $('status').textContent = cache.closed ? '終了' : stateLabel(cache.thread?.status);
+    $('status').textContent = cache.closed ? '終了' : stateLabel(cache.stateReady ? cache.thread?.status : null);
     renderProgress(cache);
     $('terminal-open').disabled = Boolean(cache.closed);
     const idle = cache.stateReady && cache.thread?.status.type === 'idle' && !cache.queue.length;
@@ -481,26 +481,20 @@ function renderComposer() {
     renderUsage();
 }
 
-function latestUserTurn(cache) {
-    return cache.turns.findLast(turn => turn.items.some(item => item.type === 'userMessage'));
-}
-
 function renderProgress(cache) {
-    const visible = !cache.closed && cache.stateReady && cache.historyReady && cache.thread?.status.type === 'active';
-    $('progress-line').hidden = !visible;
-    if (!visible) return;
-    const turn = cache.thread.provider === 'claude'
-        ? (!cache.claudeAwaitingTurn ? latestUserTurn(cache) : null)
-        : cache.turns.find(turn => turn.id === cache.activeTurnId && turn.status === 'inProgress');
+    const claude = cache.thread?.provider === 'claude';
+    const visible = !cache.closed && cache.stateReady && (claude || cache.historyReady) && cache.thread?.status.type === 'active';
+    const turn = visible && !claude ? cache.turns.find(turn => turn.id === cache.activeTurnId && turn.status === 'inProgress') : null;
     const tool = turn?.items.findLast(item => !['userMessage', 'agentMessage', 'plan'].includes(item.type) && ['inProgress', 'running'].includes(item.status));
-    const waiting = cache.thread.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
-    $('stage').hidden = Boolean(waiting);
-    $('stage').textContent = waiting ? '' : tool ? 'ツール実行中' : '作業中';
+    const waiting = cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+    $('stage').hidden = !visible || Boolean(waiting);
+    $('stage').textContent = $('stage').hidden ? '' : tool ? 'ツール実行中' : '作業中';
     const startedAt = turn?.startedAt;
     const elapsed = Date.now() - startedAt * 1000;
-    const confirmed = turn?.items.some(item => item.type === 'userMessage') && typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0 && Number.isFinite(elapsed) && elapsed >= 0;
+    const confirmed = turn?.items.filter(item => item.type === 'userMessage').length === 1 && typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0 && Number.isFinite(elapsed) && elapsed >= 0;
     $('elapsed').hidden = !confirmed;
     $('elapsed').textContent = confirmed ? `指示から${Math.floor(elapsed / 60000)}分経過` : '';
+    $('progress-line').hidden = $('stage').hidden && $('elapsed').hidden;
 }
 
 function questionKey(id, question) { return JSON.stringify([id, question.turnId, question.itemId, question.index]); }
@@ -611,7 +605,17 @@ async function refreshSelected() {
     try {
         const until = cache.turns.at(-1)?.id;
         const [state, history] = await Promise.allSettled([
-            api(`threads/${encodeURIComponent(id)}/state`),
+            api(`threads/${encodeURIComponent(id)}/state`).then(value => {
+                if (value.thread.provider === 'claude' && currentSelection(selected, generation, id, captured)) {
+                    cache.thread = value.thread; cache.stateReady = true; renderComposer();
+                }
+                return value;
+            }, error => {
+                if (cache.thread?.provider === 'claude' && currentSelection(selected, generation, id, captured)) {
+                    cache.stateReady = false; renderComposer();
+                }
+                throw error;
+            }),
             api(`threads/${encodeURIComponent(id)}/history${until ? `?until=${encodeURIComponent(until)}` : ''}`),
         ]);
         if (!currentSelection(selected, generation, id, captured)) return;
@@ -634,26 +638,6 @@ async function refreshSelected() {
             cache.turns = mergeTurns(cache.turns, history.value.turns);
             if (!cache.loaded || !hadTurns) cache.cursor = history.value.nextCursor;
             cache.loaded = true;
-        }
-        if (cache.stateReady && cache.thread.provider === 'claude') {
-            const status = cache.thread.status.type;
-            const latest = latestUserTurn(cache)?.id ?? null;
-            if (status === 'idle' && (cache.stageStatus !== 'idle' || !cache.claudeIdleBaselineReady)) {
-                cache.claudeIdleBaselineReady = cache.historyReady;
-                if (cache.historyReady) cache.claudeIdleUserTurn = latest;
-            }
-            if (status === 'active') {
-                if (!cache.claudeIdleBaselineReady && (cache.stageStatus === 'idle' || cache.claudeAwaitingTurn)) {
-                    cache.claudeAwaitingTurn = true;
-                    if (cache.historyReady) {
-                        cache.claudeIdleUserTurn = latest;
-                        cache.claudeIdleBaselineReady = true;
-                    }
-                } else {
-                    cache.claudeAwaitingTurn = Boolean(cache.claudeIdleBaselineReady) && (!latest || latest === cache.claudeIdleUserTurn);
-                }
-            }
-            if (['idle', 'active'].includes(status)) cache.stageStatus = status;
         }
         cache.error = state.status === 'rejected' ? state.reason.message : history.status === 'rejected' ? history.reason.message : null;
         renderHistory(cache); renderComposer();
