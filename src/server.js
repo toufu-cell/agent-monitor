@@ -87,11 +87,16 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     throw new HttpError(404, 'APIが見つかりません。');
                 }
                 if (request.method === 'GET') {
+                    if (url.pathname === '/api/directories') return json(200, await service.directories(url.searchParams.get('path'), url.searchParams.get('q')));
                     if (url.pathname === '/api/threads') return json(200, await service.list());
                     if (resource === 'operations' && segments.length === 3) return json(200, service.operation(id));
                     if (resource === 'launches' && segments.length === 3) return json(200, await service.launchStatus(id));
                     if (resource === 'launches' && action === 'terminal' && segments.length === 4) return json(200, await service.terminal(id, requireString(url.searchParams.get('bindingId')), 'launch'));
                     if (resource === 'threads' && segments.length === 4) {
+                        if (action === 'changes') {
+                            if (url.searchParams.getAll('path').length > 1) throw new HttpError(400, 'ファイルは1つずつ選んでください。');
+                            return json(200, await service.changes(id, url.searchParams.get('path')));
+                        }
                         if (action === 'state') return json(200, await service.questionState(id));
                         if (action === 'usage') return json(200, await service.usage(id));
                         if (action === 'history') return json(200, await service.history(id, url.searchParams.get('cursor'), url.searchParams.get('until')));
@@ -115,7 +120,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     if (action === 'send') return json(200, await service.send(id, body));
                     if (action === 'answer') return json(200, await service.answer(id, body));
                     if (action === 'answer-recover') return json(200, await service.recoverAnswer(id, body));
-                    if (action === 'bind') return json(200, await service.bind(id, body.paneId));
+                    if (action === 'bind') return json(200, await service.bind(id, body.paneId, 'thread', body.purpose));
                     if (action === 'unbind') return json(200, service.unbind(id, body.bindingId));
                     if (action === 'terminal-input') return json(200, await service.terminalInput(id, body));
                 }

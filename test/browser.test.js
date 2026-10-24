@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, readFile, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
@@ -9,6 +11,8 @@ import { notificationFixture } from './notification-fixture.js';
 
 test('320px inline terminal keeps the selected option and Enter visible', async t => {
     const f = await fixture(); t.after(() => f.close());
+    const turn = f.state.turns.get('b').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = Date.now() / 1000 - 120;
     const selectedOption = '› 1. Yes, proceed (y)';
     f.state.screen = ['› 承認画面のテストです。選択中の項目を確認してください。',
         '❯ 1. 過去の選択', ...Array.from({ length: 30 }, (_, i) => `端末の表示 ${i}`),
@@ -24,6 +28,10 @@ test('320px inline terminal keeps the selected option and Enter visible', async 
         const card = document.getElementById('approval-card'), screen = document.getElementById('approval-screen');
         const enter = document.getElementById('approval-enter').getBoundingClientRect();
         const preview = screen.getBoundingClientRect(), draft = document.getElementById('draft').getBoundingClientRect();
+        const header = document.querySelector('.conversation-header').getBoundingClientRect();
+        const changes = document.getElementById('changes-open').getBoundingClientRect();
+        const progress = document.getElementById('progress-line').getBoundingClientRect();
+        const reading = document.getElementById('reading-line').getBoundingClientRect();
         const range = document.createRange(), start = screen.textContent.indexOf(selectedOption);
         range.setStart(screen.firstChild, start); range.setEnd(screen.firstChild, start + selectedOption.length);
         const option = range.getBoundingClientRect();
@@ -31,13 +39,19 @@ test('320px inline terminal keeps the selected option and Enter visible', async 
             pageScroll: scrollY,
             optionVisible: option.top >= preview.top && option.bottom <= preview.bottom,
             draftVisible: draft.height >= 44 && draft.top >= 0 && draft.bottom <= innerHeight,
+            changesVisible: changes.top >= header.top && changes.bottom <= header.bottom && changes.left >= 0 && changes.right <= innerWidth,
+            progressVisible: progress.height > 0 && progress.top >= header.bottom && progress.bottom <= reading.top,
             enterHeight: enter.height, enterBottom: enter.bottom };
     }, selectedOption);
     await page.waitForFunction(() => !document.getElementById('approval-enter').disabled);
+    assert.equal(await page.locator('#changes-open').isVisible(), true);
+    await page.locator('#progress-line').waitFor({ state: 'visible' });
+    assert.match(await page.locator('#elapsed').textContent(), /指示から\d+分経過/);
     await page.locator('#draft').fill('承認後に送る下書き');
     const layout = await readLayout();
     assert(layout.width <= 320); assert(layout.height <= 640 * .55 + 1);
     assert(layout.optionVisible); assert(layout.draftVisible);
+    assert(layout.changesVisible); assert(layout.progressVisible);
     assert.equal(layout.pageScroll, 0);
     assert(layout.enterHeight >= 44); assert(layout.enterBottom <= 640);
     assert.equal(await page.locator('#terminal-open').isVisible(), false);
@@ -49,6 +63,7 @@ test('320px inline terminal keeps the selected option and Enter visible', async 
     await page.waitForFunction(() => !document.getElementById('approval-enter').disabled);
     const wideLayout = await readLayout();
     assert(wideLayout.optionVisible); assert(wideLayout.draftVisible);
+    assert(wideLayout.changesVisible); assert(wideLayout.progressVisible);
     await page.screenshot({ path: 'artifacts/mobile-approval-390.png', fullPage: true });
     await page.locator('#approval-enter').click();
     await page.waitForFunction(() => document.getElementById('approval-enter').disabled && !document.getElementById('approval-refresh').disabled);
@@ -60,6 +75,95 @@ test('320px inline terminal keeps the selected option and Enter visible', async 
     assert.equal(await page.locator('#approval-enter').isDisabled(), true);
     await page.locator('#approval-enter').dispatchEvent('click');
     assert.equal(f.state.writes.length, 1);
+});
+
+test('active progress keeps elapsed text visible at 320px', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const turn = f.state.turns.get('a').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = Date.now() / 1000 - 120;
+    turn.items.find(item => item.type === 'commandExecution').status = 'inProgress';
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 320, height: 720 }, isMobile: true, hasTouch: true });
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="a"]').click();
+    await page.waitForFunction(() => !document.getElementById('progress-line').hidden && !document.getElementById('elapsed').hidden);
+    assert.match(await page.locator('#elapsed').textContent(), /指示から\d+分経過/);
+    assert.equal(await page.locator('#elapsed').evaluate(element => {
+        const box = element.getBoundingClientRect();
+        return box.left >= 0 && box.right <= innerWidth && element.scrollWidth <= element.clientWidth;
+    }), true);
+    assert.equal(await page.locator('#progress-line').evaluate(element => {
+        const header = document.querySelector('.conversation-header').getBoundingClientRect();
+        const reading = document.getElementById('reading-line').getBoundingClientRect();
+        const box = element.getBoundingClientRect();
+        return box.top >= header.bottom && box.bottom <= reading.top;
+    }), true);
+    await mkdir('artifacts', { recursive: true });
+    await page.screenshot({ path: 'artifacts/mobile-stage-timer-320.png', fullPage: true });
+});
+
+test('mobile changes reads real Git diffs with usable headers at narrow widths', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await mkdtemp(join(tmpdir(), 'am-browser-changes-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const git = (...args) => promisify(execFile)('git', ['-C', root, ...args], {
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    });
+    const path = `src/${'長いファイル名'.repeat(8)}.ts`;
+    await mkdir(join(root, 'src'));
+    await writeFile(join(root, path), 'export const message = "Before";\n');
+    await git('init', '-q'); await git('add', '.');
+    await git('-c', 'user.name=Browser Test', '-c', 'user.email=browser@example.test', 'commit', '-qm', 'initial');
+    await writeFile(join(root, path), 'export const message = "<img src=x onerror=alert(1)>";\nexport const ready = true;\n');
+    await writeFile(join(root, 'new.txt'), 'スマホで新しいファイルを確認します。\n');
+    f.state.threads.get('a').cwd = join(root, 'src');
+    f.state.threads.get('a').name = '長い会話タイトルでも変更と端末の操作を使えることを確認する';
+    f.state.threads.get('b').cwd = tmpdir();
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const errors = []; page.on('pageerror', error => errors.push(error.message));
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="a"]').click();
+    await mkdir('artifacts', { recursive: true });
+    for (const width of [390, 320]) {
+        await page.setViewportSize({ width, height: 844 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        const controls = await page.locator('.conversation-header').evaluate(header => [...header.children].filter(child => child.getBoundingClientRect().width).map(child => {
+            const box = child.getBoundingClientRect(); return { id: child.id || child.className, x: box.x, right: box.right, width: box.width };
+        }));
+        assert.ok(controls.every(control => control.x >= 0 && control.right <= width && control.width > 0), JSON.stringify(controls));
+        await page.screenshot({ path: `artifacts/mobile-changes-header-${width}.png`, fullPage: true });
+        await page.locator('#changes-open').click();
+        await page.locator('#changes-file').selectOption(path);
+        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('export const ready = true;'));
+        assert.equal(await page.locator('#changes-diff img').count(), 0);
+        assert.deepEqual(await page.locator('.diff-addition .diff-label').allTextContents(), ['追加', '追加']);
+        assert.deepEqual(await page.locator('.diff-deletion .diff-label').allTextContents(), ['削除']);
+        assert.equal(await page.locator('#changes-summary').textContent(), '差分全体: 追加2行 · 削除1行');
+        assert.notEqual(await page.locator('.diff-addition').first().evaluate(row => getComputedStyle(row).backgroundColor), await page.locator('.diff-deletion').first().evaluate(row => getComputedStyle(row).backgroundColor));
+        assert.equal(await page.locator('#changes-dialog').evaluate(dialog => dialog.scrollWidth <= dialog.clientWidth), true);
+        for (const id of ['changes-file', 'changes-refresh', 'changes-close']) {
+            const box = await page.locator(`#${id}`).boundingBox();
+            assert.ok(box.x >= 0 && box.x + box.width <= width && box.height >= 44, id);
+        }
+        await page.screenshot({ path: `artifacts/mobile-changes-diff-${width}.png`, fullPage: true });
+        await page.locator('#changes-diff').focus();
+        assert.equal(await page.locator('#changes-diff').evaluate(diff => document.activeElement === diff && diff.scrollWidth > diff.clientWidth), true);
+        await page.locator('#changes-diff').press('ArrowRight');
+        await page.waitForFunction(() => document.getElementById('changes-diff').scrollLeft > 0);
+        await page.locator('#changes-file').selectOption('new.txt');
+        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('スマホで新しいファイルを確認します。'));
+        await page.locator('#changes-close').click();
+    }
+    await page.locator('#back').click(); await page.locator('.thread-button[data-thread-id="b"]').click();
+    await page.locator('#changes-open').click();
+    await page.getByText('この会話の作業ディレクトリはGit管理外です。', { exact: true }).waitFor();
+    assert.equal(await page.locator('#changes-file').isDisabled(), true);
+    assert.deepEqual(errors, []);
 });
 
 test('mobile image previews decode all supported formats and upload only on send', async t => {
@@ -128,10 +232,17 @@ test('mobile notification worker receives and opens threads with a manifest and 
     const worker = context.serviceWorkers()[0];
     assert.ok(worker);
     await worker.evaluate(() => self.dispatchEvent(new PushEvent('push', { data: JSON.stringify({ title: 'APIのレスポンスを確認', body: '作業が完了しました', url: '/?thread=b' }) })));
-    await page.waitForFunction(async () => (await (await navigator.serviceWorker.ready).getNotifications()).length > 0);
     await worker.evaluate(async () => {
-        const [notification] = await self.registration.getNotifications();
-        self.dispatchEvent(new NotificationEvent('notificationclick', { notification }));
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+            const [notification] = await self.registration.getNotifications();
+            if (notification) {
+                self.dispatchEvent(new NotificationEvent('notificationclick', { notification }));
+                return;
+            }
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        throw new Error('Notification did not become available');
     });
     await page.waitForFunction(() => document.getElementById('title').textContent === 'APIのレスポンスを確認');
     assert.equal(new URL(page.url()).searchParams.get('thread'), 'b');
@@ -139,8 +250,8 @@ test('mobile notification worker receives and opens threads with a manifest and 
     await page.getByText('2件の会話 · 接続済み · 通知の会話は終了しているか、PCで開かれていません。', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => document.body.classList.contains('reading')), false);
     await page.waitForFunction(() => !document.getElementById('notification-toggle').disabled);
-    const cdp = await context.newCDPSession(page);
-    await cdp.send('Browser.setPermission', { permission: { name: 'notifications' }, setting: 'denied', origin: f.origin });
+    await context.clearPermissions();
+    await context.grantPermissions([], { origin: f.origin });
     await page.locator('#notification-toggle').click();
     await page.getByText('通知を許可してから有効にしてください。', { exact: true }).waitFor();
     assert.equal(await page.locator('#notification-test').isHidden(), true);
@@ -362,7 +473,62 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     assert.deepEqual(errors, []);
 });
 
-test('mobile launch validates paths, restores pending state and opens the resolved conversation', async t => {
+for (const provider of ['codex', 'claude']) test(`folder picker searches at 320px and 390px and launches ${provider} in the chosen folder`, async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.initialShellPending = true;
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-browser-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const child = join(root, 'group', 'a-long-project-folder-name-for-a-narrow-phone-screen');
+    await mkdir(child, { recursive: true });
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 }, isMobile: true, hasTouch: true });
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('#launch-open').tap();
+    await page.locator('#launch-provider').selectOption(provider);
+    await page.locator('#launch-path').fill(root);
+    await page.locator('#folder-browse').tap();
+    await page.getByRole('button', { name: 'group', exact: true }).waitFor();
+    for (const width of [320, 390]) {
+        await page.setViewportSize({ width, height: 844 });
+        await page.locator('#folder-search').fill('narrow');
+        const searched = page.waitForResponse(response => response.url().includes('/api/directories?') && response.url().includes('q=narrow'));
+        if (width === 320) await page.locator('#folder-search').press('Enter');
+        else await page.locator('#folder-search-button').tap();
+        await searched;
+        await page.getByRole('button', { name: 'group/a-long-project-folder-name-for-a-narrow-phone-screen', exact: true }).waitFor();
+        assert.equal(f.state.creates.length, 0);
+        const layout = await page.evaluate(() => {
+            const dialog = document.getElementById('launch-dialog');
+            const ids = ['launch-provider', 'launch-path', 'folder-browse', 'folder-parent', 'folder-use', 'folder-search', 'folder-search-button'];
+            const controls = [...ids.map(id => document.getElementById(id)), ...document.querySelectorAll('#folder-list button')];
+            return { overflow: dialog.scrollWidth > dialog.clientWidth,
+                controls: controls.map(button => { const box = button.getBoundingClientRect(); return { x: box.x, right: box.right, height: box.height }; }),
+                actionsBottom: document.querySelector('.folder-actions').getBoundingClientRect().bottom,
+                listTop: document.getElementById('folder-list').getBoundingClientRect().top };
+        });
+        assert.equal(layout.overflow, false);
+        assert(layout.controls.every(box => box.x >= 0 && box.right <= width && box.height >= 44));
+        assert(layout.actionsBottom <= layout.listTop);
+        await mkdir('artifacts', { recursive: true });
+        await page.screenshot({ path: `artifacts/folder-search-${provider}-${width}.png`, fullPage: true });
+    }
+    await page.locator('#folder-list button').tap();
+    await page.waitForFunction(path => document.getElementById('folder-path').textContent === path, child);
+    await page.getByText('子フォルダはありません。', { exact: true }).waitFor();
+    await page.locator('#folder-use').tap();
+    assert.equal(await page.locator('#launch-path').inputValue(), child);
+    assert.equal(await page.locator('#folder-browser').isHidden(), true);
+    const launched = page.waitForResponse(response => response.url() === `${f.origin}/api/launches` && response.request().method() === 'POST');
+    await page.locator('#launch-submit').tap();
+    const response = await launched;
+    assert.equal(response.request().postDataJSON().path, child);
+    assert.equal(response.request().postDataJSON().provider, provider);
+    await page.waitForFunction(() => document.getElementById('folder-browse').disabled);
+    assert.equal(f.state.creates[0].params.cwd, child);
+});
+
+for (const provider of ['codex', 'claude']) test(`mobile ${provider} launch restores pending state and opens the conversation`, async t => {
     const f = await fixture(); t.after(() => f.close());
     f.state.launchThread = false;
     const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
@@ -371,20 +537,33 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(`${f.origin}/#${f.token}`);
-    await page.getByRole('button', { name: '新しいCodex会話', exact: true }).click();
+    await page.getByRole('button', { name: '新しい会話', exact: true }).click();
+    assert.equal(await page.locator('#launch-provider').inputValue(), 'codex');
+    await page.locator('#launch-provider').selectOption(provider);
+    const selectBox = await page.locator('#launch-provider').boundingBox();
+    assert(selectBox.height >= 44);
+    assert.equal(await page.locator('#launch-submit').textContent(), provider === 'claude' ? 'Claudeを起動' : 'Codexを起動');
     await page.locator('#launch-path').fill('relative/path');
     await page.locator('#launch-submit').click();
     assert.match(await page.locator('#launch-state').textContent(), /絶対パス/);
     assert.equal(f.state.creates.length, 0);
     await page.locator('#launch-path').fill(process.cwd());
+    const launched = page.waitForResponse(response => response.url() === `${f.origin}/api/launches` && response.request().method() === 'POST');
     await page.locator('#launch-submit').click();
+    const response = await launched;
+    assert.equal(response.request().postDataJSON().path, process.cwd());
+    assert.equal(response.request().postDataJSON().provider, provider);
     await page.waitForFunction(() => !document.getElementById('launch-terminal').hidden);
     const requestId = await page.evaluate(() => sessionStorage.getItem('launchRequestId'));
     assert.equal(await page.locator('#launch-submit').isDisabled(), true);
     await mkdir('artifacts', { recursive: true });
-    await page.screenshot({ path: 'artifacts/mobile-launch.png', fullPage: true });
+    await page.screenshot({ path: `artifacts/mobile-${provider}-launch.png`, fullPage: true });
     await page.reload();
     await page.getByRole('button', { name: '起動状態を確認', exact: true }).click();
+    assert.equal(await page.locator('#launch-provider').inputValue(), provider);
+    assert.equal(await page.locator('#launch-provider').isDisabled(), true);
+    assert.equal(await page.locator('#launch-path').inputValue(), process.cwd());
+    if (provider === 'claude') assert.match(await page.locator('#launch-state').textContent(), /最初の指示.*Enter/);
     await page.locator('#launch-terminal').click();
     assert.equal(await page.locator('#launch-dialog').evaluate(dialog => dialog.open), false);
     const paneId = await page.locator('#pane-select').inputValue();
@@ -393,18 +572,29 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     assert.equal(await page.evaluate(() => sessionStorage.getItem('launchRequestId')), requestId);
     await page.locator('#bind').click();
     await page.waitForFunction(() => !document.getElementById('terminal-send').disabled);
-    await page.screenshot({ path: 'artifacts/mobile-launch-terminal.png', fullPage: true });
+    await page.screenshot({ path: `artifacts/mobile-${provider}-launch-terminal.png`, fullPage: true });
+    if (provider === 'claude') {
+        await page.locator('#terminal-text').fill('起動後の最初の指示');
+        await page.locator('#terminal-send').click();
+        await page.waitForFunction(() => !document.getElementById('terminal-send').disabled);
+        assert.deepEqual(f.state.writes.at(-1), { pane_id: paneId, text: '起動後の最初の指示' });
+    }
     await page.getByRole('button', { name: 'Enter', exact: true }).click();
     await page.waitForFunction(() => document.getElementById('terminal-result').textContent.includes('端末へ送信しました。'));
+    assert.deepEqual(f.state.writes.at(-1), { pane_id: paneId, keys: ['Enter'] });
     await page.locator('#terminal-close').click();
     assert.equal(await page.locator('#launch-dialog').evaluate(dialog => dialog.open), true);
     assert.equal(await page.locator('#terminal-dialog').evaluate(dialog => dialog.open), false);
     const threadId = f.state.resolveLaunch(f.state.panes.find(pane => pane.pane_id === paneId));
     await page.waitForFunction(() => document.getElementById('title').textContent === '新しく起動した会話');
-    await page.locator('#draft').fill('起動後の最初の指示');
+    await page.locator('#draft').fill('会話を開いた後の指示');
     await page.locator('#send').click();
     await page.waitForFunction(() => document.getElementById('draft').value === '');
-    assert.equal(f.state.calls.find(call => call.method === 'thread/queue/add').params.threadId, threadId);
+    if (provider === 'codex') assert.equal(f.state.calls.find(call => call.method === 'thread/queue/add').params.threadId, threadId);
+    else {
+        assert(threadId.startsWith('claude:'));
+        assert.equal(f.state.writes.at(-1).pane_id, paneId);
+    }
     assert.equal(await page.evaluate(() => sessionStorage.getItem('launchRequestId')), null);
     assert.deepEqual(errors, []);
 });

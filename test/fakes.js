@@ -70,6 +70,13 @@ export async function fixture({ now = Date.now } = {}) {
     state.resolveLaunch = pane => {
         const process = state.processes.get(pane.pane_id);
         const pid = process.foreground_processes[0].pid;
+        if (process.foreground_processes[0].argv?.[0] === 'claude') {
+            const sessionId = `00000000-0000-4000-8000-${String(pid).padStart(12, '0')}`;
+            state.claudeSessions.push({ kind: 'interactive', pid, sessionId, cwd: pane.cwd,
+                startedAt: 1792082000000, name: '新しく起動した会話', status: 'idle' });
+            pane.agent_session = { value: sessionId, agent: 'claude' };
+            return `claude:${sessionId}`;
+        }
         const id = `launched-${pid}`;
         state.resources.set(pid, { ports: new Set(), threadIds: new Set([id]) });
         state.threads.set(id, { id, name: '新しく起動した会話', cwd: pane.cwd, source: 'cli', status: { type: 'notLoaded' }, updatedAt: 1792082000 });
@@ -185,13 +192,18 @@ export async function fixture({ now = Date.now } = {}) {
                 }
                 case 'pane.send_input':
                     state.writes.push(request.params);
-                    if (request.params.pane_id.startsWith('launch-p') && request.params.text === 'env -u CODEX_THREAD_ID codex' && request.params.keys?.[0] === 'Enter') {
+                    if (request.params.pane_id.startsWith('launch-p')
+                        && ['env -u CODEX_THREAD_ID codex',
+                            'env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID claude'].includes(request.params.text)
+                        && request.params.keys?.[0] === 'Enter') {
                         const pane = state.panes.find(pane => pane.pane_id === request.params.pane_id);
                         const process = state.processes.get(pane.pane_id);
                         if (process.foreground_processes[0].name === 'zsh') {
                             const pid = process.shell_pid + 100;
                             process.foreground_process_group_id = pid;
-                            process.foreground_processes = [{ pid, name: 'codex', argv: ['codex'], cwd: pane.cwd }];
+                            const provider = request.params.text.endsWith(' claude') ? 'claude' : 'codex';
+                            process.foreground_processes = [{ pid, name: provider, argv: [provider], cwd: pane.cwd }];
+                            if (provider === 'claude') { state.ansiScreen = claudeScreen(); state.screen = 'Claude Code\n❯ 次の指示'; }
                             if (state.launchThread) state.resolveLaunch(pane);
                         }
                     }
