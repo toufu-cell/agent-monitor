@@ -29,11 +29,16 @@ let terminalBusy = false;
 let terminalRequest = 0;
 let terminalResultRequestId = null;
 let terminalOwner = null;
+let changesRequest = 0;
 let launchId = sessionStorage.getItem('launchRequestId') || null;
 let launchState = launchId ? { requestId: launchId, state: 'waiting' } : null;
 let launchBusy = false;
 let launchPolling = false;
 let launchError = '';
+let folderListing = null;
+let folderRequest = 0;
+let folderBusy = false;
+let folderError = '';
 const caches = new Map();
 const ranks = new Map();
 const drafts = getStored('drafts', {});
@@ -175,10 +180,79 @@ function renderLaunch() {
     $('launch-state').classList.toggle('error', Boolean(launchError) || ['failed', 'unknown'].includes(state));
     $('launch-terminal').hidden = !launchState?.terminalAvailable;
     $('launch-resolve').hidden = state !== 'unknown' || launchBusy;
+    renderFolders();
+}
+
+function invalidateFolders() {
+    folderRequest++;
+    folderBusy = false;
+}
+
+function closeLaunch() {
+    invalidateFolders();
+    folderListing = null; folderError = '';
+    $('folder-search').value = '';
+    $('folder-browser').hidden = true;
+    $('folder-list').replaceChildren();
+    renderFolders();
+    $('launch-dialog').close();
+}
+
+function renderFolders() {
+    const disabled = $('launch-path').disabled;
+    $('folder-browse').disabled = disabled;
+    $('folder-browse').setAttribute('aria-expanded', String(!$('folder-browser').hidden));
+    $('folder-path').textContent = folderListing?.path || 'フォルダを選んでください。';
+    $('folder-parent').disabled = disabled || folderBusy || !folderListing?.parent;
+    $('folder-use').disabled = disabled || folderBusy || !folderListing;
+    $('folder-search').disabled = disabled || folderBusy || !folderListing;
+    $('folder-search-button').disabled = disabled || folderBusy || !folderListing;
+    $('folder-state').textContent = folderBusy ? 'フォルダを読み込み中…' : folderError
+        || (folderListing && !folderListing.truncated && !folderListing.directories.length
+            ? (folderListing.query ? '一致するフォルダはありません。' : '子フォルダはありません。') : '');
+    $('folder-state').classList.toggle('error', Boolean(folderError));
+    $('folder-limit').hidden = !folderListing?.truncated;
+    $('folder-list-help').textContent = folderListing?.query ? '検索結果（相対パス）' : '子フォルダ（タップすると開きます）';
+    $('folder-limit').textContent = folderListing?.query
+        ? '検索結果の一部を表示しています。上限に達したか、読み取れない子フォルダがあります。検索起点を狭めるか、パスを直接入力してください。'
+        : folderListing?.directories.length
+        ? '一覧の一部を表示しています。見つからないフォルダはパスを直接入力できます。'
+        : '一覧の取得が上限に達しました。走査した範囲に子フォルダはありません。パスを直接入力できます。';
+    $('folder-list').setAttribute('aria-busy', String(folderBusy));
+    for (const button of $('folder-list').querySelectorAll('button')) button.disabled = disabled || folderBusy;
+}
+
+async function browseFolders(path, query = '') {
+    if ($('launch-path').disabled) return;
+    const request = ++folderRequest;
+    const focusInList = $('folder-list').contains(document.activeElement);
+    folderBusy = true; folderError = ''; renderFolders();
+    try {
+        const params = new URLSearchParams();
+        if (path) params.set('path', path);
+        if (query) params.set('q', query);
+        const listing = await api(`directories?${params}`);
+        if (request !== folderRequest) return;
+        folderListing = listing;
+        if (!query) $('folder-search').value = '';
+        $('folder-list').replaceChildren(...listing.directories.map(directory => {
+            const button = node('button', directory.relativePath || directory.name);
+            button.type = 'button';
+            button.addEventListener('click', () => browseFolders(directory.path));
+            return button;
+        }));
+        if (focusInList) $('folder-path').focus();
+    } catch (error) {
+        if (request !== folderRequest) return;
+        folderError = `フォルダを取得できません。${error.message}`;
+    } finally {
+        if (request === folderRequest) { folderBusy = false; renderFolders(); }
+    }
 }
 
 function openLaunch() {
     closeTerminal({ returnToLaunch: false });
+    closeChanges();
     renderLaunch();
     if (!$('launch-dialog').open) $('launch-dialog').showModal();
     refreshLaunch();
@@ -199,7 +273,7 @@ async function settleLaunch(result) {
     if (!ranks.has(thread.id)) ranks.set(thread.id, ranks.size);
     cacheFor(thread.id).thread = thread;
     launchId = null; sessionStorage.removeItem('launchRequestId');
-    $('launch-dialog').close();
+    closeLaunch();
     closeTerminal({ returnToLaunch: false });
     renderLaunch(); renderList();
     await selectThread(thread.id);
@@ -222,6 +296,7 @@ async function refreshLaunch() {
 async function startLaunch(event) {
     event.preventDefault();
     if ($('launch-submit').disabled) return;
+    invalidateFolders();
     const path = $('launch-path').value;
     if (!path.trim() || path.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(path)
         || !(path.startsWith('/') || path === '~' || path.startsWith('~/'))) {
@@ -253,6 +328,10 @@ async function confirmLaunch() {
     finally { launchBusy = false; renderLaunch(); }
 }
 
+function needsAttention(status) {
+    return status?.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+}
+
 function renderList() {
     const focused = document.activeElement;
     const focusedThread = focused?.dataset.threadId;
@@ -260,18 +339,21 @@ function renderList() {
     const scroll = $('thread-list').scrollTop;
     const query = $('search').value.toLocaleLowerCase();
     const visible = threads.filter(thread => `${thread.cwd} ${thread.title} ${thread.preview}`.toLocaleLowerCase().includes(query));
-    visible.sort((a, b) => Number(pins.has(b.id)) - Number(pins.has(a.id)) || ranks.get(a.id) - ranks.get(b.id));
+    const priority = thread => needsAttention(thread.status) ? 2 : Number(pins.has(thread.id));
+    visible.sort((a, b) => priority(b) - priority(a) || ranks.get(a.id) - ranks.get(b.id));
+    const attentionGroup = Symbol();
     const groups = new Map();
     for (const thread of visible) {
-        const key = pins.has(thread.id) ? 'ピン留め' : thread.cwd;
+        const key = needsAttention(thread.status) ? attentionGroup : pins.has(thread.id) ? 'ピン留め' : thread.cwd;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(thread);
     }
     const fragment = document.createDocumentFragment();
     for (const [project, entries] of groups) {
-        fragment.append(node('h2', project || '場所未設定', 'project-group'));
+        const attention = project === attentionGroup;
+        fragment.append(node('h2', attention ? '対応が必要' : project || '場所未設定', `project-group${attention ? ' attention-heading' : ''}`));
         for (const thread of entries) {
-            const row = node('div', undefined, `thread-row${thread.id === selected ? ' selected' : ''}`);
+            const row = node('div', undefined, `thread-row${attention ? ' attention' : ''}${thread.id === selected ? ' selected' : ''}`);
             const button = node('button', undefined, 'thread-button');
             button.dataset.threadId = thread.id;
             button.append(node('span', thread.title, 'thread-title'), node('span', thread.preview, 'thread-preview'));
@@ -326,6 +408,7 @@ async function selectThread(id) {
         return;
     }
     closeTerminal({ returnToLaunch: false });
+    closeChanges();
     rememberConversation();
     selected = id; generation++;
     save();
@@ -337,6 +420,7 @@ async function selectThread(id) {
     $('title').textContent = thread.title; $('project').textContent = thread.cwd;
     $('draft').value = drafts[id] || ''; $('draft').disabled = false;
     $('terminal-open').disabled = false;
+    $('changes-open').disabled = false;
     $('turns').replaceChildren();
     $('questions').replaceChildren();
     document.body.classList.add('reading');
@@ -456,6 +540,7 @@ function renderComposer() {
     $('status').textContent = cache.closed ? '終了' : stateLabel(cache.stateReady ? cache.thread?.status : null);
     renderProgress(cache);
     $('terminal-open').disabled = Boolean(cache.closed);
+    $('changes-open').disabled = Boolean(cache.closed);
     const idle = cache.stateReady && cache.thread?.status.type === 'idle' && !cache.queue.length;
     const active = cache.stateReady && cache.thread?.status.type === 'active' && !cache.thread.status.activeFlags?.length;
     $('send').disabled = (!idle && !active) || Boolean(operation) || Boolean(missingImage) || (!$('draft').value.trim() && !image);
@@ -475,7 +560,7 @@ function renderComposer() {
         : cache.queue.length ? '待機中の指示があります。処理が終わると送信できます。'
         : idle ? '待機中のPCの会話へ送信します。' : `${stateLabel(cache.thread?.status)}です。端末で状態を確認できます。`);
     $('resolve').hidden = operation?.state !== 'unknown';
-    $('composer-terminal').hidden = cache.closed || !cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+    $('composer-terminal').hidden = cache.closed || !needsAttention(cache.thread?.status);
     $('queue').replaceChildren(...cache.queue.map(item => node('p', `待機中の指示\n${item.text}`)));
     renderQuestions();
     renderUsage();
@@ -486,7 +571,7 @@ function renderProgress(cache) {
     const visible = !cache.closed && cache.stateReady && (claude || cache.historyReady) && cache.thread?.status.type === 'active';
     const turn = visible && !claude ? cache.turns.find(turn => turn.id === cache.activeTurnId && turn.status === 'inProgress') : null;
     const tool = turn?.items.findLast(item => !['userMessage', 'agentMessage', 'plan'].includes(item.type) && ['inProgress', 'running'].includes(item.status));
-    const waiting = cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+    const waiting = needsAttention(cache.thread?.status);
     $('stage').hidden = !visible || Boolean(waiting);
     $('stage').textContent = $('stage').hidden ? '' : tool ? 'ツール実行中' : '作業中';
     const startedAt = turn?.startedAt;
@@ -732,6 +817,7 @@ async function poll() {
             cache.closed = !threads.some(thread => thread.id === selected);
             if (cache.closed) {
                 generation++;
+                closeChanges();
                 cache.usage = null;
                 cache.stateReady = false;
                 if (terminalOwner?.resource === 'threads') closeTerminal();
@@ -751,6 +837,7 @@ async function poll() {
         refreshUsage();
         await refreshSelected();
     } catch (error) {
+        closeChanges();
         $('connection').textContent = `接続を確認してください。${error.message}`; $('connection').classList.add('error');
         if (selected) { cacheFor(selected).usageRequest = null; cacheFor(selected).usage = null; cacheFor(selected).stateReady = false; renderComposer(); }
     } finally { polling = false; }
@@ -795,7 +882,7 @@ function showTerminalResult(operation, result) {
 }
 
 async function openTerminal(owner) {
-    if ($('launch-dialog').open) $('launch-dialog').close();
+    if ($('launch-dialog').open) closeLaunch();
     terminalOwner = owner?.resource ? owner : { resource: 'threads', id: selected };
     const target = terminalOwner, id = target.id, request = invalidateTerminal();
     terminalResultRequestId = pending.terminal?.requestId || null;
@@ -892,15 +979,159 @@ async function terminalInput(key) {
     }
 }
 
+function closeChanges() {
+    changesRequest++;
+    clearChangesDiff();
+    if ($('changes-dialog').open) $('changes-dialog').close();
+}
+
+function clearChangesDiff() {
+    $('changes-diff').replaceChildren();
+    $('changes-diff').hidden = true;
+    $('changes-summary').textContent = '';
+    $('changes-limit').textContent = '';
+}
+
+function renderChangesDiff(diff) {
+    const MAX_VISIBLE_LINES = 2000;
+    const lines = diff.split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    const start = lines[0]?.startsWith('--- ') && lines[1]?.startsWith('+++ ') ? 2 : 0;
+    let additions = 0, deletions = 0;
+    const fragment = document.createDocumentFragment();
+    for (let i = start; i < lines.length; i++) {
+        const line = lines[i];
+        const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        const kind = hunk ? 'hunk' : line === '\\ No newline at end of file' ? 'note'
+            : line.startsWith('+') ? 'addition' : line.startsWith('-') ? 'deletion' : 'context';
+        if (kind === 'addition') additions++;
+        if (kind === 'deletion') deletions++;
+        if (i - start >= MAX_VISIBLE_LINES) continue;
+        const row = node('span', '', `diff-line diff-${kind}`);
+        if (kind === 'addition' || kind === 'deletion') row.append(node('span', kind === 'addition' ? '追加' : '削除', 'diff-label'));
+        else if (kind === 'context') row.append(node('span', '', 'diff-label'));
+        const content = kind === 'addition' || kind === 'deletion' || line.startsWith(' ') ? line.slice(1) : line;
+        row.append(node('span', (hunk ? `変更箇所 · ${hunk[2] === '0' ? `変更前${hunk[1]}` : hunk[2]}行目付近`
+            : kind === 'note' ? '注記: 直前の行は末尾に改行がありません。' : content) + '\n', 'diff-text'));
+        fragment.append(row);
+    }
+    $('changes-summary').textContent = `差分全体: 追加${additions}行 · 削除${deletions}行`;
+    if (lines.length - start > MAX_VISIBLE_LINES) $('changes-limit').textContent = `先頭${MAX_VISIBLE_LINES}行だけを表示しています。残りはPCで確認してください。`;
+    $('changes-diff').replaceChildren(fragment);
+    $('changes-diff').hidden = false;
+}
+
+function currentChanges(request, id, captured) {
+    return changesRequest === request && $('changes-dialog').open && currentSelection(selected, generation, id, captured);
+}
+
+async function loadChangesFile() {
+    const path = $('changes-file').value;
+    const id = selected, captured = generation, request = ++changesRequest;
+    $('changes-path').textContent = path;
+    clearChangesDiff();
+    $('changes-detail').textContent = path ? '差分を読み込んでいます…' : '';
+    $('changes-detail').classList.remove('error');
+    if (!path) return;
+    try {
+        const result = await api(`threads/${encodeURIComponent(id)}/changes?path=${encodeURIComponent(path)}`);
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-detail').textContent = result.message || '';
+        if (result.diff) renderChangesDiff(result.diff);
+        $('changes-diff').scrollTop = 0;
+        $('changes-diff').scrollLeft = 0;
+    } catch (error) {
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-detail').textContent = error.message;
+        $('changes-detail').classList.add('error');
+    }
+}
+
+async function loadChanges() {
+    if (!selected) return;
+    const id = selected, captured = generation, request = ++changesRequest;
+    const previous = $('changes-file').value;
+    $('changes-file').replaceChildren();
+    $('changes-file').disabled = true;
+    $('changes-root').textContent = '';
+    $('changes-path').textContent = '';
+    $('changes-detail').textContent = '';
+    clearChangesDiff();
+    $('changes-state').textContent = '変更ファイルを読み込んでいます…';
+    $('changes-state').classList.remove('error');
+    try {
+        const result = await api(`threads/${encodeURIComponent(id)}/changes`);
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-root').textContent = result.root || '';
+        const files = result.files || [];
+        $('changes-state').textContent = result.message || (files.length ? `${files.length}件 · ファイルを選ぶと差分を表示します。` : '作業ツリーに変更はありません。');
+        for (const file of files) {
+            const label = file.status === '??' ? '未追跡' : file.status.includes('U') ? '競合' : file.status.includes('D') ? '削除' : file.status.includes('A') ? '追加' : '変更';
+            const option = node('option', `${label} · ${file.path}`); option.value = file.path;
+            $('changes-file').append(option);
+        }
+        $('changes-file').disabled = !files.length;
+        if (files.some(file => file.path === previous)) $('changes-file').value = previous;
+        if (files.length) await loadChangesFile();
+    } catch (error) {
+        if (!currentChanges(request, id, captured)) return;
+        $('changes-state').textContent = error.message;
+        $('changes-state').classList.add('error');
+    }
+}
+
+$('changes-open').addEventListener('click', () => {
+    if (!selected || cacheFor(selected).closed) return;
+    $('changes-dialog').showModal();
+    loadChanges();
+});
+$('changes-close').addEventListener('click', closeChanges);
+$('changes-dialog').addEventListener('cancel', event => { event.preventDefault(); closeChanges(); });
+$('changes-dialog').addEventListener('close', () => { if (!$('changes-dialog').open) { changesRequest++; clearChangesDiff(); } });
+$('changes-refresh').addEventListener('click', loadChanges);
+$('changes-file').addEventListener('change', loadChangesFile);
+
 $('search').addEventListener('input', renderList);
 $('launch-open').addEventListener('click', openLaunch);
 $('launch-form').addEventListener('submit', startLaunch);
-$('launch-close').addEventListener('click', () => $('launch-dialog').close());
-$('launch-dialog').addEventListener('cancel', event => { event.preventDefault(); $('launch-dialog').close(); });
+$('launch-path').addEventListener('input', () => {
+    invalidateFolders(); folderError = '';
+    $('folder-browser').hidden = true; renderFolders();
+});
+$('folder-browse').addEventListener('click', () => {
+    $('folder-browser').hidden = !$('folder-browser').hidden;
+    if ($('folder-browser').hidden) { invalidateFolders(); renderFolders(); }
+    else browseFolders($('launch-path').value);
+});
+$('folder-parent').addEventListener('click', () => {
+    if (!$('folder-parent').disabled) browseFolders(folderListing.parent);
+});
+function searchFolders() {
+    if ($('folder-search').disabled || !folderListing) return;
+    const query = $('folder-search').value.trim();
+    browseFolders(folderListing.path, query);
+}
+$('folder-search-button').addEventListener('click', searchFolders);
+$('folder-search').addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); searchFolders(); }
+});
+$('folder-search').addEventListener('input', () => {
+    invalidateFolders(); folderError = '';
+    if (!$('folder-search').value.trim() && folderListing?.query) browseFolders(folderListing.path);
+    else renderFolders();
+});
+$('folder-use').addEventListener('click', () => {
+    if ($('folder-use').disabled) return;
+    invalidateFolders();
+    $('launch-path').value = folderListing.path;
+    $('folder-browser').hidden = true; renderFolders(); $('launch-path').focus();
+});
+$('launch-close').addEventListener('click', closeLaunch);
+$('launch-dialog').addEventListener('cancel', event => { event.preventDefault(); closeLaunch(); });
 $('launch-resolve').addEventListener('click', confirmLaunch);
 $('launch-terminal').addEventListener('click', () => {
     if (!launchId || !launchState?.terminalAvailable) return;
-    $('launch-dialog').close();
+    closeLaunch();
     openTerminal({ resource: 'launches', id: launchId });
 });
 $('draft').addEventListener('input', () => { if (selected) drafts[selected] = $('draft').value; save(); renderComposer(); });
@@ -934,7 +1165,7 @@ $('send').addEventListener('click', sendMessage);
 $('older').addEventListener('click', olderHistory);
 $('history').addEventListener('scroll', readingPosition);
 $('latest').addEventListener('click', () => { $('history').scrollTop = $('history').scrollHeight; readingPosition(); });
-$('back').addEventListener('click', () => { rememberConversation(); closeTerminal(); document.body.classList.remove('reading'); });
+$('back').addEventListener('click', () => { rememberConversation(); closeTerminal(); closeChanges(); document.body.classList.remove('reading'); });
 $('resolve').addEventListener('click', () => {
     if (window.confirm('PCで送信結果を確認しましたか？下書きを解除すると、新しい操作として送信できるようになります。')) {
         delete pending[selected]; save(); renderComposer();
