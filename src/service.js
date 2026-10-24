@@ -1043,6 +1043,21 @@ export class MonitorService {
         return matches.length === 1 && samePane(pane, matches[0]);
     }
 
+    async recheckClaudeLaunchInput(id, bindingId, paneId) {
+        const sessions = await this.claude.sessions({ fresh: true });
+        try {
+            const { pane, process } = await this.identity(id, paneId, 'launch');
+            if (!await this.claudeLaunchPaneMatches(pane, process, sessions)) {
+                const launch = this.getLaunch(id);
+                launch.state = 'unknown'; launch.message = '起動したClaudeの会話との対応を確認できません。PCで確認してください。';
+                throw new HttpError(409, launch.message);
+            }
+        } catch (error) {
+            this.bindings.delete(bindingId);
+            throw error;
+        }
+    }
+
     terminalInput(id, body, owner = 'thread') {
         const hasText = typeof body.text === 'string';
         if (hasText) {
@@ -1056,20 +1071,18 @@ export class MonitorService {
         return this.once(body.requestId, JSON.stringify(['terminal', owner, id, body.bindingId, body.text, body.key]), async () => {
             const binding = await this.binding(id, body.bindingId, owner);
             return this.paneInput(binding.paneId, async () => {
-                if (owner === 'launch' && this.getLaunch(id).provider === 'claude') {
-                    const sessions = await this.claude.sessions({ fresh: true });
-                    const { pane, process } = await this.identity(id, binding.paneId, owner);
-                    if (!await this.claudeLaunchPaneMatches(pane, process, sessions)) {
-                        const launch = this.getLaunch(id);
-                        launch.state = 'unknown'; launch.message = '起動したClaudeの会話との対応を確認できません。PCで確認してください。';
-                        this.bindings.delete(body.bindingId);
-                        throw new HttpError(409, launch.message);
-                    }
-                }
+                const claudeLaunch = owner === 'launch' && this.getLaunch(id).provider === 'claude';
+                if (claudeLaunch) await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId);
                 if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
                 const { read } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
                 if (createHash('sha256').update(read.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
+                if (claudeLaunch) await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId);
                 await this.binding(id, body.bindingId, owner);
+                const { read: latestRead } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
+                if (this.bindings.get(body.bindingId) !== binding || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
+                if (owner === 'launch' && this.getLaunch(id).state !== 'waiting') throw new HttpError(409, '起動状態を更新して端末を選び直してください。');
+                if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
+                if (createHash('sha256').update(latestRead.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
                 binding.view = null;
                 const key = body.key === 'Ctrl-C' ? 'ctrl+c' : body.key;
                 return this.herdr.call('pane.send_input', { pane_id: binding.paneId, ...(hasText ? { text: body.text } : { keys: [key] }) });

@@ -193,6 +193,108 @@ test('Claude launch rejects a screen changed during session lookup before sendin
     assert.equal(f.state.writes.length, 1);
 });
 
+test('Claude launch rejects stale terminal views during the final session lookup', async t => {
+    for (const change of ['screen', 'view', 'expired']) {
+        await t.test(change, async t => {
+            const f = await launchFixture(t); f.state.launchThread = false;
+            const requestId = `launch_claude_final_view_${change}_123456`;
+            await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+            const waiting = await f.settled(requestId);
+            const endpoint = `/api/launches/${requestId}`;
+            const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
+            const binding = (await f.request(`${endpoint}/bind`, { paneId: pane.pane_id })).body;
+            const view = (await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).body;
+            f.state.resolveLaunch(pane);
+            const readGate = { ...Promise.withResolvers(), paneId: pane.pane_id, entered: Promise.withResolvers() };
+            const sessionGate = { ...Promise.withResolvers(), entered: Promise.withResolvers() };
+            t.after(() => { readGate.resolve(); sessionGate.resolve(); });
+            f.state.readGate = readGate;
+            const pending = f.request(`${endpoint}/terminal-input`, { requestId: 'claude_final_view_input_123456',
+                bindingId: binding.bindingId, viewId: view.viewId, key: 'Enter' });
+            await readGate.entered.promise;
+            f.state.claudeGate = sessionGate;
+            readGate.resolve();
+            await sessionGate.entered.promise;
+            if (change === 'screen') f.state.screen = 'Claude Code\nChanged trust prompt';
+            else if (change === 'view') await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`);
+            else {
+                t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+                t.mock.timers.tick(30001);
+            }
+            sessionGate.resolve();
+            const sent = await pending;
+            assert.equal(sent.body.state, 'failed');
+            assert.equal(sent.body.message, change === 'screen'
+                ? '端末表示が変わりました。更新して確認してください。' : '端末表示を更新してから操作してください。');
+            assert.equal(f.state.herdrCalls.filter(call => call.method === 'pane.send_input').length, 1);
+        });
+    }
+});
+
+test('Claude launch rejects state changes and revoked bindings during the final terminal read', async t => {
+    for (const change of ['unknown', 'ready', 'unbound', 'expired']) {
+        await t.test(change, async t => {
+            const f = await launchFixture(t); f.state.launchThread = false;
+            const requestId = `launch_claude_final_binding_${change}_123456`;
+            await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+            const waiting = await f.settled(requestId);
+            const endpoint = `/api/launches/${requestId}`;
+            const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
+            const binding = (await f.request(`${endpoint}/bind`, { paneId: pane.pane_id })).body;
+            const view = (await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).body;
+            f.state.resolveLaunch(pane);
+            const firstRead = { ...Promise.withResolvers(), paneId: pane.pane_id, entered: Promise.withResolvers() };
+            const finalRead = { ...Promise.withResolvers(), paneId: pane.pane_id, entered: Promise.withResolvers() };
+            t.after(() => { firstRead.resolve(); finalRead.resolve(); });
+            f.state.readGate = firstRead;
+            const pending = f.request(`${endpoint}/terminal-input`, { requestId: 'claude_final_binding_input_123456',
+                bindingId: binding.bindingId, viewId: view.viewId, key: 'Enter' });
+            await firstRead.entered.promise;
+            f.state.readGate = finalRead;
+            firstRead.resolve();
+            await finalRead.entered.promise;
+            if (change === 'unknown' || change === 'ready') {
+                if (change === 'unknown') pane.agent_session.value = 'different';
+                assert.equal((await f.status(requestId)).state, change);
+                assert.equal(f.service.bindings.has(binding.bindingId), change === 'unknown');
+            } else if (change === 'unbound') await f.request(`${endpoint}/unbind`, { bindingId: binding.bindingId });
+            else f.service.bindings.get(binding.bindingId).expires = Date.now() - 1;
+            finalRead.resolve();
+            assert.equal((await pending).body.state, 'failed');
+            assert.equal(f.state.herdrCalls.filter(call => call.method === 'pane.send_input').length, 1);
+        });
+    }
+});
+
+test('Claude launch rechecks session correspondence after reading the terminal before input', async t => {
+    for (const change of ['hook', 'session']) {
+        await t.test(change, async t => {
+            const f = await launchFixture(t); f.state.launchThread = false;
+            const requestId = `launch_claude_read_race_${change}_123456`;
+            await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+            const waiting = await f.settled(requestId);
+            const endpoint = `/api/launches/${requestId}`;
+            const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
+            const binding = (await f.request(`${endpoint}/bind`, { paneId: pane.pane_id })).body;
+            const view = (await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).body;
+            f.state.resolveLaunch(pane);
+            const gate = { ...Promise.withResolvers(), paneId: pane.pane_id, entered: Promise.withResolvers() };
+            t.after(() => gate.resolve());
+            f.state.readGate = gate;
+            const pending = f.request(`${endpoint}/terminal-input`, { requestId: 'claude_read_race_input_123456',
+                bindingId: binding.bindingId, viewId: view.viewId, key: 'Enter' });
+            await gate.entered.promise;
+            if (change === 'hook') pane.agent_session.value = 'different';
+            else f.state.claudeSessions[0].sessionId = '00000000-0000-4000-8000-000000000999';
+            gate.resolve();
+            assert.equal((await pending).body.state, 'failed');
+            assert.equal(f.state.herdrCalls.filter(call => call.method === 'pane.send_input').length, 1);
+            assert.equal(f.service.bindings.has(binding.bindingId), false);
+            assert.equal((await f.status(requestId)).state, 'unknown');
+        });
+    }
+});
+
 test('Claude launch terminal rejects changed identity and conflicting sessions before input', async t => {
     for (const change of ['pid', 'executable', 'argv0', 'group', 'multiple', 'duplicate', 'cwd', 'hook', 'panes']) {
         await t.test(change, async t => {
