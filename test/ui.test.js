@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile, mkdtemp, realpath, mkdir, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { JSDOM } from 'jsdom';
 import { fixture, codexScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
@@ -96,6 +97,78 @@ async function mount(t, f, manualPolling = false, stored = {}, count = 2) {
     await waitFor(() => $('connection').textContent.includes(`${count}件`));
     return { window, $ };
 }
+
+test('attention conversations precede pins, retain first-seen order and return to their groups', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { window, $ } = await mount(t, f);
+    const button = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`);
+    const pin = id => window.document.querySelector(`.pin[data-thread-id="${id}"]`);
+    const layout = () => [...$('thread-list').children].map(element => element.matches('h2') ? element.textContent : element.querySelector('.thread-button').dataset.threadId);
+    const refresh = async () => {
+        const first = $('thread-list').firstChild;
+        window.document.dispatchEvent(new window.Event('visibilitychange'));
+        await waitFor(() => $('thread-list').firstChild !== first);
+    };
+    assert.deepEqual(layout(), ['対応が必要', 'b', '/projects/agent-monitor', 'a']);
+    pin('a').click();
+    assert.deepEqual(layout(), ['対応が必要', 'b', 'ピン留め', 'a']);
+    pin('b').click();
+    assert.deepEqual(layout(), ['対応が必要', 'b', 'ピン留め', 'a']);
+    assert.equal(pin('b').getAttribute('aria-pressed'), 'true');
+    pin('a').click();
+    button('a').click();
+    await waitFor(() => $('status').textContent === '待機中');
+    assert.equal($('composer-terminal').hidden, true);
+    for (const [flag, label] of [
+        ['waitingOnApproval', '承認待ち'],
+        ['waitingOnUserInput', '質問待ち'],
+        ['waitingOnApprovalOrInput', '承認・回答待ち'],
+    ]) {
+        button('a').focus();
+        f.state.threads.get('a').status = { type: 'active', activeFlags: [flag] };
+        await refresh();
+        await waitFor(() => $('status').textContent === label);
+        assert.deepEqual(layout(), ['対応が必要', 'a', 'b']);
+        assert.equal($('composer-terminal').hidden, false);
+        assert.equal(window.document.activeElement, button('a'));
+    }
+    f.state.threads.get('b').status = { type: 'idle' };
+    f.state.panes[1].agent_status = 'idle';
+    pin('b').focus();
+    await refresh();
+    assert.deepEqual(layout(), ['対応が必要', 'a', 'ピン留め', 'b']);
+    assert.equal(window.document.activeElement, pin('b'));
+    assert.equal(pin('b').getAttribute('aria-pressed'), 'true');
+    f.state.threads.get('a').status = { type: 'active', activeFlags: ['otherFlag'] };
+    await refresh();
+    await waitFor(() => $('status').textContent === '作業中');
+    assert.deepEqual(layout(), ['ピン留め', 'b', '/projects/agent-monitor', 'a']);
+    assert.equal($('composer-terminal').hidden, true);
+    pin('b').click();
+    f.state.panes.reverse();
+    await refresh();
+    assert.deepEqual(layout(), ['/projects/agent-monitor', 'a', '/projects/sample-api', 'b']);
+});
+
+test('search shows attention headings only for matching waiting conversations', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { window, $ } = await mount(t, f, true);
+    const search = query => {
+        $('search').value = query;
+        $('search').dispatchEvent(new window.Event('input'));
+    };
+    search('API');
+    assert.deepEqual([...$('thread-list').querySelectorAll('.project-group')].map(element => element.textContent), ['対応が必要']);
+    assert.deepEqual([...$('thread-list').querySelectorAll('.thread-button')].map(element => element.dataset.threadId), ['b']);
+    search('モバイル');
+    assert.deepEqual([...$('thread-list').querySelectorAll('.project-group')].map(element => element.textContent), ['/projects/agent-monitor']);
+    search('存在しない会話');
+    assert.equal($('thread-list').querySelector('.project-group'), null);
+    assert.equal($('thread-list').querySelector('.thread-button'), null);
+    assert.equal($('thread-list').textContent, '条件に合う会話がありません。');
+    search('');
+    assert.deepEqual([...$('thread-list').querySelectorAll('.thread-button')].map(element => element.dataset.threadId), ['b', 'a']);
+});
 
 test('image upload deadlines allow slow transfers while ordinary API deadlines stay short', async t => {
     const f = await fixture(); t.after(() => f.close());
@@ -474,6 +547,171 @@ test('question drafts and recovery survive turn end, unavailable history and CLI
     }
 });
 
+test('active progress uses confirmed Codex turns and hides uncertain elapsed time', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const turn = f.state.turns.get('a').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = 1800000000;
+    turn.items.find(item => item.type === 'commandExecution').status = 'inProgress';
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    const { window, $ } = await mount(t, f, true);
+    window.Date.now = () => 1800000120000;
+    window.document.querySelector('[data-thread-id="a"]').click();
+    await waitFor(() => !$('progress-line').hidden);
+    assert.equal($('stage').textContent, 'ツール実行中');
+    assert.equal($('elapsed').textContent, '指示から2分経過');
+    assert.equal($('progress-line').hasAttribute('aria-live'), false);
+    let revision = 0, override = null;
+    const fetch = window.fetch;
+    window.fetch = async (path, options) => {
+        const response = await fetch(path, options);
+        if (!override || !path.endsWith('/state')) return response;
+        const value = await response.json(); override(value);
+        return new Response(JSON.stringify(value), { status: response.status });
+    };
+    async function refresh() {
+        const text = `進捗確認 ${++revision}`;
+        turn.items.find(item => item.type === 'agentMessage').text = text;
+        window.document.dispatchEvent(new window.Event('visibilitychange'));
+        await waitFor(() => $('turns').textContent.includes(text));
+    }
+    turn.items.find(item => item.type === 'commandExecution').status = 'completed';
+    await refresh(); assert.equal($('stage').textContent, '作業中');
+    for (const timestamp of [null, '1800000000', 1800000121, -1]) {
+        turn.startedAt = timestamp; await refresh(); assert.equal($('elapsed').hidden, true);
+    }
+    turn.startedAt = 1800000000;
+    override = value => { value.activeTurnId = 'other-turn'; };
+    await refresh(); assert.equal($('elapsed').hidden, true);
+    override = value => { value.activeTurnId = turn.id; };
+    turn.status = 'completed';
+    await refresh(); assert.equal($('elapsed').hidden, true);
+    override = null;
+    f.state.threads.get('a').status = { type: 'idle' }; f.state.panes[0].agent_status = 'idle';
+    await refresh(); assert.equal($('progress-line').hidden, true);
+    f.state.threads.get('a').status = { type: 'active', activeFlags: ['waitingOnApproval'] }; f.state.panes[0].agent_status = 'blocked';
+    turn.status = 'inProgress';
+    await refresh(); assert.equal($('status').textContent, '承認・回答待ち'); assert.equal($('elapsed').hidden, false);
+    assert.equal($('stage').textContent, ''); assert.equal($('stage').hidden, true);
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    turn.items.push({ id: 'additional-instruction', type: 'userMessage', content: [{ type: 'text', text: '追加の指示' }] });
+    turn.items.find(item => item.type === 'commandExecution').status = 'inProgress';
+    await refresh();
+    assert.equal($('progress-line').hidden, false);
+    assert.equal($('elapsed').hidden, true); assert.equal($('elapsed').textContent, '');
+    assert.equal($('stage').hidden, false); assert.equal($('stage').textContent, 'ツール実行中');
+    f.state.failHistory = true;
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => $('history-notice').classList.contains('error'));
+    assert.equal($('progress-line').hidden, true);
+    f.state.failHistory = false; f.state.failState = true;
+    await refresh(); assert.equal($('progress-line').hidden, true);
+    f.state.failState = false; f.state.panes.shift();
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => $('status').textContent === '終了');
+    assert.equal($('progress-line').hidden, true);
+});
+
+function assertClaudeProgress($, visible) {
+    assert.equal($('progress-line').hidden, !visible);
+    assert.equal($('stage').hidden, !visible);
+    assert.equal($('stage').textContent, visible ? '作業中' : '');
+    assert.equal($('elapsed').hidden, true);
+    assert.equal($('elapsed').textContent, '');
+}
+
+test('Claude progress uses active state before history and clears elapsed when switching from Codex', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const turn = f.state.turns.get('a').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = 1800000000;
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    const c = await f.addClaude();
+    await c.write([c.row('user', '古い指示'), c.row('assistant', [{ type: 'tool_use', id: 'old-tool', name: 'Read', input: {} }])]);
+    c.session.status = 'busy'; f.state.ansiScreen = '';
+    const { window, $ } = await mount(t, f, true, {}, 3);
+    window.Date.now = () => 1800000120000;
+    window.document.querySelector('[data-thread-id="a"]').click();
+    await waitFor(() => $('elapsed').textContent === '指示から2分経過');
+    assert.equal($('elapsed').textContent, '指示から2分経過');
+    const history = holdResponse(window, path => path.startsWith('/api/threads/' + encodeURIComponent(c.id) + '/history'));
+    window.document.querySelector(`[data-thread-id="${c.id}"]`).click();
+    assertClaudeProgress($, false);
+    await waitFor(() => history.seen && !$('progress-line').hidden);
+    assert.equal(history.consumed, false);
+    assert.equal($('status').textContent, '作業中');
+    assertClaudeProgress($, true);
+    history.release();
+    await waitFor(() => $('turns').textContent.includes('古い指示'));
+    assert.match($('turns').textContent, /Read/);
+    assertClaudeProgress($, true);
+    const pollUntil = check => waitFor(() => {
+        if (check()) return true;
+        window.document.dispatchEvent(new window.Event('visibilitychange')); return false;
+    });
+    c.session.status = 'waiting'; c.session.waitingFor = 'input needed';
+    await pollUntil(() => $('status').textContent === '承認・回答待ち');
+    assertClaudeProgress($, false);
+    c.session.status = 'idle'; delete c.session.waitingFor;
+    await pollUntil(() => $('status').textContent === '待機中');
+    assertClaudeProgress($, false);
+    c.session.status = 'busy';
+    await pollUntil(() => $('status').textContent === '作業中');
+    assertClaudeProgress($, true);
+});
+
+test('Claude progress handles failed history, failed state, stale generations and closure', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const c = await f.addClaude();
+    await c.write([c.row('user', 'Claudeの履歴')]);
+    c.session.status = 'busy'; f.state.ansiScreen = '';
+    const { window, $ } = await mount(t, f, true, {}, 3);
+    const base = '/api/threads/' + encodeURIComponent(c.id);
+    const fetch = window.fetch;
+    let failState = false, failHistory = true;
+    window.fetch = (path, options) => path === base + '/state' && failState
+        ? Promise.resolve(new Response(JSON.stringify({ error: '状態取得エラー' }), { status: 503 }))
+        : path.startsWith(base + '/history') && failHistory
+        ? Promise.resolve(new Response(JSON.stringify({ error: '履歴取得エラー' }), { status: 503 })) : fetch(path, options);
+    const pollUntil = check => waitFor(() => {
+        if (check()) return true;
+        window.document.dispatchEvent(new window.Event('visibilitychange')); return false;
+    });
+    const select = id => window.document.querySelector(`[data-thread-id="${id}"]`).click();
+    select(c.id);
+    await waitFor(() => $('history-notice').textContent.includes('履歴取得エラー'));
+    assertClaudeProgress($, true);
+    failHistory = false; failState = true;
+    const history = holdResponse(window, path => path.startsWith(base + '/history'));
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => history.seen && $('progress-line').hidden);
+    assert.equal(history.consumed, false);
+    assert.equal($('status').textContent, '状態未確認');
+    assertClaudeProgress($, false);
+    history.release();
+    await waitFor(() => $('history-notice').textContent.includes('状態取得エラー'));
+    assertClaudeProgress($, false);
+    failState = false;
+    await pollUntil(() => !$('progress-line').hidden && $('history-notice').hidden);
+    assertClaudeProgress($, true);
+    const state = holdResponse(window, path => path === base + '/state');
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await waitFor(() => state.seen);
+    select('a');
+    await waitFor(() => $('send-state').textContent.includes('待機中のPC'));
+    select(c.id);
+    assertClaudeProgress($, false);
+    state.release();
+    await waitFor(() => state.consumed);
+    assertClaudeProgress($, false);
+    await pollUntil(() => !$('progress-line').hidden);
+    assertClaudeProgress($, true);
+    f.state.panes = f.state.panes.filter(pane => pane.pane_id !== c.pane.pane_id);
+    await pollUntil(() => $('status').textContent === '終了');
+    assertClaudeProgress($, false);
+});
+
 test('Claude shares the conversation composer and retains drafts while awaiting input', async t => {
     const f = await fixture(); t.after(() => f.close());
     const c = await f.addClaude(true);
@@ -514,6 +752,115 @@ function holdResponse(window, matches) {
     };
     return held;
 }
+
+test('changes dialog selects files as text, shows empty states and discards stale reads', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    let mode = 'files';
+    f.service.changes = async (id, path) => {
+        if (path !== null) {
+            if (mode === 'unavailable') return { state: 'unavailable', path, message: '内容を表示できません。' };
+            if (mode === 'deleted') return { state: 'ready', path, diff: `--- a/${path}\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n` };
+            return { state: 'ready', path, diff: mode === 'large'
+                ? `--- a/${path}\n+++ b/${path}\n@@ -1 +1,2500 @@\n-old\n${'+x\n'.repeat(2500)}`
+                : `--- a/${path}\n+++ b/${path}\n@@ -5,3 +9,4 @@\n  common\t\n---old\n-old\n+++new\n+${id}/${path}\n+<img src=x onerror=alert(1)>\n\\ No newline at end of file\n` };
+        }
+        if (mode === 'notGit') return { state: 'notGit', files: [], message: 'この会話の作業ディレクトリはGit管理外です。' };
+        return { state: 'ready', root: '/projects/repo', files: mode === 'empty' ? [] : [
+            { path: 'one.txt', status: ' M' }, { path: 'two.txt', status: '??' },
+        ] };
+    };
+    const { window, $ } = await mount(t, f, true);
+    const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
+    select('a'); $('changes-open').click();
+    await waitFor(() => $('changes-diff').textContent.includes('a/one.txt'));
+    assert.equal($('changes-file').options.length, 2);
+    assert.equal($('changes-diff').querySelector('img'), null);
+    assert.equal($('changes-summary').textContent, '差分全体: 追加3行 · 削除2行');
+    assert.deepEqual([...$('changes-diff').querySelectorAll('.diff-label')].map(label => label.textContent), ['', '削除', '削除', '追加', '追加', '追加']);
+    assert.equal($('changes-detail').textContent, '');
+    assert.equal($('changes-diff').querySelector('.diff-context .diff-text').textContent, ' common\t\n');
+    assert.equal($('changes-diff').querySelector('.diff-hunk').textContent, '変更箇所 · 9行目付近\n');
+    assert.match($('changes-diff').querySelector('.diff-note').textContent, /末尾に改行がありません/);
+    assert.deepEqual([...$('changes-diff').querySelectorAll('.diff-deletion .diff-text, .diff-addition .diff-text')].map(text => text.textContent), ['--old\n', 'old\n', '++new\n', 'a/one.txt\n', '<img src=x onerror=alert(1)>\n']);
+    assert.doesNotMatch($('changes-diff').textContent, /--- a\/|\+\+\+ b\//);
+    const choose = path => { $('changes-file').value = path; $('changes-file').dispatchEvent(new window.Event('change')); };
+    const held = holdResponse(window, path => path.includes('/changes?path=one.txt'));
+    choose('one.txt'); await waitFor(() => held.seen);
+    assert.equal($('changes-summary').textContent, '');
+    choose('two.txt'); await waitFor(() => $('changes-diff').textContent.includes('a/two.txt'));
+    held.release(); await waitFor(() => held.consumed);
+    assert.match($('changes-diff').textContent, /a\/two.txt/);
+    for (const transition of ['reopen', 'conversation']) {
+        const stale = holdResponse(window, path => path.includes('/changes?path=one.txt'));
+        choose('one.txt'); await waitFor(() => stale.seen);
+        if (transition === 'reopen') $('changes-close').click();
+        else { select('b'); assert.equal($('changes-dialog').open, false); }
+        $('changes-open').click();
+        await waitFor(() => !$('changes-file').disabled && $('changes-diff').textContent.includes('/one.txt'));
+        choose('two.txt');
+        await waitFor(() => $('changes-diff').textContent.includes(`${transition === 'reopen' ? 'a' : 'b'}/two.txt`));
+        stale.release(); await waitFor(() => stale.consumed);
+        assert.equal($('changes-file').value, 'two.txt');
+        assert.match($('changes-diff').textContent, /\/two.txt/);
+        assert.equal($('changes-summary').textContent, '差分全体: 追加3行 · 削除2行');
+    }
+    mode = 'deleted'; choose('one.txt');
+    await waitFor(() => $('changes-summary').textContent === '差分全体: 追加0行 · 削除2行');
+    assert.equal($('changes-diff').querySelector('.diff-hunk').textContent, '変更箇所 · 変更前1行目付近\n');
+    mode = 'large'; choose('one.txt');
+    await waitFor(() => $('changes-limit').textContent.includes('先頭2000行'));
+    assert.equal($('changes-diff').children.length, 2000);
+    assert.equal($('changes-summary').textContent, '差分全体: 追加2500行 · 削除1行');
+    mode = 'unavailable'; choose('two.txt');
+    await waitFor(() => $('changes-detail').textContent === '内容を表示できません。');
+    assert.equal($('changes-diff').hidden, true);
+    assert.equal($('changes-summary').textContent, '');
+    assert.equal($('changes-limit').textContent, '');
+    mode = 'large'; choose('one.txt');
+    await waitFor(() => $('changes-limit').textContent.includes('先頭2000行'));
+    const staleList = holdResponse(window, path => path.endsWith('/changes'));
+    $('changes-refresh').click(); await waitFor(() => staleList.seen);
+    assert.equal($('changes-summary').textContent, '');
+    assert.equal($('changes-limit').textContent, '');
+    $('changes-close').click(); mode = 'empty'; $('changes-open').click();
+    await waitFor(() => $('changes-state').textContent === '作業ツリーに変更はありません。');
+    staleList.release(); await waitFor(() => staleList.consumed);
+    assert.equal($('changes-file').options.length, 0); assert.equal($('changes-diff').hidden, true);
+    assert.equal($('changes-file').disabled, true);
+    assert.equal($('changes-summary').textContent, '');
+    mode = 'notGit'; $('changes-refresh').click();
+    await waitFor(() => $('changes-state').textContent.includes('Git管理外'));
+});
+
+test('changes dialog closes on thread end and poll failure and discards late responses', async t => {
+    for (const transition of ['ended', 'poll failure']) {
+        await t.test(transition, async t => {
+            const f = await fixture(); t.after(() => f.close());
+            f.service.changes = async (id, path) => path === null
+                ? { state: 'ready', root: '/projects/repo', files: [{ path: 'one.txt', status: ' M' }] }
+                : { state: 'ready', path, diff: '--- a/one.txt\n+++ b/one.txt\n@@ -0,0 +1 @@\n+current content\n' };
+            const { window, $ } = await mount(t, f, true);
+            window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+            await waitFor(() => $('send-state').textContent.includes('待機中のPC'));
+            $('changes-open').click();
+            await waitFor(() => $('changes-diff').textContent.includes('current content'));
+            const stale = holdResponse(window, path => path.includes('/changes?path='));
+            $('changes-file').dispatchEvent(new window.Event('change'));
+            await waitFor(() => stale.seen);
+            if (transition === 'ended') f.state.process.foreground_processes = [{ pid: 100, name: 'zsh', argv: ['zsh'] }];
+            else f.state.failHerdr = true;
+            window.document.dispatchEvent(new window.Event('visibilitychange'));
+            await waitFor(() => transition === 'ended' ? $('status').textContent === '終了' : $('connection').classList.contains('error'));
+            assert.equal($('changes-dialog').open, false);
+            stale.release(); await waitFor(() => stale.consumed);
+            assert.equal($('changes-dialog').open, false);
+            assert.equal($('changes-diff').textContent, '');
+            assert.equal($('changes-diff').hidden, true);
+            assert.equal($('changes-summary').textContent, '');
+            assert.equal($('changes-limit').textContent, '');
+        });
+    }
+});
 
 test('UI retains history and drafts, rejects stale responses, and recovers after errors', async t => {
     const f = await fixture(); t.after(() => f.close());
@@ -614,6 +961,223 @@ test('UI retains history and drafts, rejects stale responses, and recovers after
     assert.equal(JSON.parse(window.sessionStorage.getItem('pending')).a.state, 'unknown');
 });
 
+test('folder picker distinguishes incomplete results from an empty directory', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-limit-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await Promise.all(Array.from({ length: 201 }, (_, i) => mkdir(join(root, `folder-${i}`))));
+    const { window, $ } = await mount(t, f, true);
+    assert.equal($('launch-path').nextElementSibling, $('launch-help'));
+    assert.match($('folder-list-help').textContent, /子フォルダ.*タップすると開きます/);
+    assert.equal($('folder-list').getAttribute('aria-labelledby'), 'folder-list-help');
+    $('launch-open').click(); $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => !$('folder-limit').hidden);
+    assert.equal($('folder-list').querySelectorAll('button').length, 200);
+    assert.match($('folder-limit').textContent, /パスを直接入力/);
+    assert.equal($('folder-state').textContent, '');
+    $('folder-search').value = 'folder-'; $('folder-search-button').click();
+    await waitFor(() => !$('folder-use').disabled && $('folder-list').childElementCount === 100);
+    assert.equal($('folder-limit').hidden, false);
+    assert.match($('folder-limit').textContent, /検索起点を狭める.*パスを直接入力/);
+    $('folder-search').value = ''; $('folder-search').dispatchEvent(new window.Event('input'));
+    await waitFor(() => !$('folder-use').disabled && $('folder-list').childElementCount === 200);
+    $('folder-list').querySelector('button').click();
+    await waitFor(() => $('folder-state').textContent === '子フォルダはありません。');
+    assert.equal($('folder-limit').hidden, true);
+    const files = join(root, 'files'); await mkdir(files);
+    await Promise.all(Array.from({ length: 2001 }, (_, i) => writeFile(join(files, `file-${i}`), '')));
+    $('launch-path').value = files; $('launch-path').dispatchEvent(new window.Event('input'));
+    $('folder-browse').click();
+    await waitFor(() => !$('folder-limit').hidden);
+    assert.equal($('folder-list').childElementCount, 0);
+    assert.equal($('folder-state').textContent, '');
+    assert.match($('folder-limit').textContent, /上限.*走査した範囲.*パスを直接入力/);
+});
+
+test('folder search supports Enter, result navigation, clearing and stale response rejection', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-search-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const child = join(root, 'group', 'Project'); await mkdir(child, { recursive: true });
+    const { window, $ } = await mount(t, f, true);
+    const initial = holdResponse(window, path => path.startsWith('/api/directories'));
+    $('launch-open').click(); $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => initial.seen);
+    assert.equal($('folder-search').disabled, true);
+    assert.equal($('folder-search-button').disabled, true);
+    initial.release(); await waitFor(() => initial.consumed);
+    await waitFor(() => !$('folder-use').disabled);
+    assert.equal($('folder-search').disabled, false);
+    const search = value => {
+        $('folder-search').value = value;
+        $('folder-search').dispatchEvent(new window.Event('input'));
+        const event = new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+        $('folder-search').dispatchEvent(event);
+        assert.equal(event.defaultPrevented, true);
+    };
+    search('project');
+    await waitFor(() => $('folder-list').textContent === 'group/Project');
+    assert.equal(f.state.creates.length, 0);
+    const held = holdResponse(window, path => path.includes('q=absent'));
+    search('absent'); await waitFor(() => held.seen);
+    $('folder-search').value = ''; $('folder-search').dispatchEvent(new window.Event('input'));
+    await waitFor(() => !$('folder-use').disabled && $('folder-list').textContent === 'group');
+    held.release(); await waitFor(() => held.consumed);
+    assert.equal($('folder-list').textContent, 'group');
+    search('absent'); await waitFor(() => $('folder-state').textContent === '一致するフォルダはありません。');
+    search('project'); await waitFor(() => $('folder-list').textContent === 'group/Project');
+    const fetch = window.fetch;
+    window.fetch = (path, options) => path.includes('q=failed') ? Promise.reject(new Error('Search unavailable')) : fetch(path, options);
+    search('failed'); await waitFor(() => $('folder-state').classList.contains('error'));
+    assert.equal($('folder-list').textContent, 'group/Project');
+    assert.equal($('folder-path').textContent, root);
+    assert.equal($('folder-search').disabled, false);
+    $('folder-list').querySelector('button').click();
+    await waitFor(() => $('folder-path').textContent === child);
+    assert.equal($('folder-search').value, '');
+    $('folder-use').click(); assert.equal($('launch-path').value, child);
+    $('launch-close').click(); $('launch-open').click();
+    window.fetch = (path, options) => path.startsWith('/api/directories') ? Promise.reject(new Error('Listing unavailable')) : fetch(path, options);
+    $('folder-browse').click(); await waitFor(() => $('folder-state').classList.contains('error'));
+    assert.equal($('folder-search').disabled, true);
+    window.fetch = fetch;
+    $('folder-browse').click(); $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    assert.equal($('folder-search').disabled, false);
+    assert.equal($('folder-path').textContent, child);
+});
+
+test('folder search waits for the new listing before using the changed launch path', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-search-origin-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const first = join(root, 'first'), second = join(root, 'second');
+    await Promise.all([mkdir(join(first, 'old-project'), { recursive: true }), mkdir(join(second, 'new-project'), { recursive: true })]);
+    const { window, $ } = await mount(t, f, true);
+    $('launch-open').click(); $('launch-path').value = first; $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    const searches = [], fetch = window.fetch;
+    window.fetch = (path, options) => {
+        const url = new URL(path, f.origin);
+        if (url.pathname === '/api/directories' && url.searchParams.has('q')) searches.push(url.searchParams.get('path'));
+        return fetch(path, options);
+    };
+    const held = holdResponse(window, path => new URL(path, f.origin).searchParams.get('path') === second);
+    t.after(() => held.release());
+    $('launch-path').value = second; $('launch-path').dispatchEvent(new window.Event('input'));
+    $('folder-browse').click(); await waitFor(() => held.seen);
+    assert.equal($('folder-path').textContent, first);
+    assert.equal($('folder-list').textContent, 'old-project');
+    $('folder-search').value = 'project';
+    $('folder-search-button').click();
+    $('folder-search').dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    assert.deepEqual(searches, []);
+    assert.equal($('folder-search').disabled, true);
+    assert.equal($('folder-search-button').disabled, true);
+    held.release(); await waitFor(() => held.consumed);
+    await waitFor(() => !$('folder-use').disabled);
+    assert.equal($('folder-path').textContent, second);
+    assert.equal($('folder-search').disabled, false);
+    assert.equal($('folder-search-button').disabled, false);
+    $('folder-search').value = 'project'; $('folder-search-button').click();
+    await waitFor(() => !$('folder-use').disabled && $('folder-list-help').textContent === '検索結果（相対パス）');
+    assert.deepEqual(searches, [second]);
+    assert.equal($('folder-list').textContent, 'new-project');
+});
+
+test('closing launch discards pending folder responses and reopens from the current input', async t => {
+    for (const close of ['button', 'escape', 'handoff']) {
+        await t.test(close, async t => {
+            const f = await fixture(); t.after(() => f.close());
+            const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-close-ui-')));
+            t.after(() => rm(root, { recursive: true, force: true }));
+            const child = join(root, 'child'); await mkdir(child);
+            const { window, $ } = await mount(t, f, true);
+            window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+            await waitFor(() => !$('terminal-open').disabled);
+            $('launch-open').click(); $('launch-path').value = root;
+            $('folder-browse').click(); await waitFor(() => !$('folder-use').disabled);
+            const held = holdResponse(window, path => path.includes('q=child'));
+            $('folder-search').value = 'child'; $('folder-search-button').click(); await waitFor(() => held.seen);
+            if (close === 'button') $('launch-close').click();
+            else if (close === 'escape') $('launch-dialog').dispatchEvent(new window.Event('cancel', { cancelable: true }));
+            else $('terminal-open').click();
+            assert.equal($('launch-dialog').open, false);
+            assert.equal($('folder-browser').hidden, true);
+            assert.equal($('folder-browse').getAttribute('aria-expanded'), 'false');
+            held.release(); await waitFor(() => held.consumed);
+            assert.equal($('folder-list').childElementCount, 0);
+            assert.notEqual($('folder-path').textContent, root);
+            $('launch-path').value = child; $('launch-open').click();
+            assert.equal($('folder-browser').hidden, true);
+            $('folder-browse').click();
+            await waitFor(() => $('folder-path').textContent === child);
+            assert.equal($('folder-state').textContent, '子フォルダはありません。');
+        });
+    }
+});
+
+test('folder picker preserves confirmed navigation and ignores responses after typing or launch', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    f.state.initialShellPending = true; f.state.launchThread = false;
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const child = join(root, 'child'); await mkdir(child);
+    const { window, $ } = await mount(t, f, true);
+    $('launch-open').click();
+    $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => $('folder-path').textContent === root);
+    assert.equal($('folder-browse').getAttribute('aria-expanded'), 'true');
+    const navigation = holdResponse(window, path => path.startsWith('/api/directories'));
+    const childButton = $('folder-list').querySelector('button');
+    childButton.focus(); childButton.click();
+    await waitFor(() => navigation.seen);
+    assert.equal(childButton.disabled, true);
+    childButton.blur(); // Model browser focus loss when the active button becomes disabled.
+    navigation.release(); await waitFor(() => navigation.consumed);
+    await waitFor(() => $('folder-path').textContent === child);
+    assert.equal(window.document.activeElement, $('folder-path'));
+    assert.match($('folder-state').textContent, /子フォルダはありません/);
+    $('folder-parent').click();
+    await waitFor(() => $('folder-path').textContent === root);
+    await rm(child, { recursive: true });
+    $('folder-list').querySelector('button').click();
+    await waitFor(() => $('folder-state').classList.contains('error'));
+    assert.equal($('folder-path').textContent, root);
+    assert.equal($('folder-list').querySelector('button').textContent, 'child');
+    $('folder-use').click();
+    assert.equal($('launch-path').value, root);
+    assert.equal($('folder-browser').hidden, true);
+    assert.equal(window.document.activeElement.id, 'launch-path');
+
+    $('folder-browse').click(); await waitFor(() => !$('folder-use').disabled);
+    const held = holdResponse(window, path => path.includes('q=child'));
+    $('folder-search').value = 'child'; $('folder-search-button').click(); await waitFor(() => held.seen);
+    $('launch-path').value = child; $('launch-path').dispatchEvent(new window.Event('input'));
+    held.release(); await waitFor(() => held.consumed);
+    assert.equal($('folder-browser').hidden, true);
+    assert.equal($('launch-path').value, child);
+    assert.equal($('folder-path').textContent, root);
+
+    await mkdir(child);
+    $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    $('folder-use').click();
+    $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    const pending = holdResponse(window, path => path.startsWith('/api/directories'));
+    $('folder-search').value = 'child'; $('folder-search-button').click(); await waitFor(() => pending.seen);
+    $('launch-form').dispatchEvent(new window.Event('submit', { cancelable: true }));
+    assert.equal($('folder-browse').disabled, true);
+    assert.equal($('folder-use').disabled, true);
+    pending.release(); await waitFor(() => pending.consumed);
+    await waitFor(() => f.state.creates.length === 1);
+    assert.equal(f.state.creates[0].params.cwd, root);
+    assert.equal($('folder-path').textContent, root);
+    assert.equal($('folder-list').querySelector('button').textContent, 'child');
+    assert.equal($('folder-list').querySelector('button').disabled, true);
+});
+
 test('launch UI prevents repeat requests, recovers by ID and hands off after trust confirmation', async t => {
     const f = await fixture(); t.after(() => f.close());
     f.state.launchThread = false;
@@ -694,6 +1258,10 @@ test('Claude selection is fixed by the snapshot and unknown restored launches us
     assert.equal($('launch-submit').textContent, 'Claudeを起動');
     $('launch-path').value = process.cwd();
     $('launch-form').dispatchEvent(new window.Event('submit', { cancelable: true }));
+    $('launch-provider').value = 'codex'; $('launch-path').value = '/changed-after-submission';
+    $('launch-provider').dispatchEvent(new window.Event('change'));
+    assert.equal($('launch-provider').value, 'claude');
+    assert.equal($('launch-path').value, process.cwd());
     await waitFor(() => {
         window.document.dispatchEvent(new window.Event('visibilitychange'));
         return !$('launch-terminal').hidden;
@@ -704,6 +1272,7 @@ test('Claude selection is fixed by the snapshot and unknown restored launches us
     restored.window.document.dispatchEvent(new restored.window.Event('visibilitychange'));
     await waitFor(() => !restored.$('launch-terminal').hidden);
     assert.equal(restored.$('launch-provider').value, 'claude');
+    assert.equal(restored.$('launch-path').value, process.cwd());
     assert.match(restored.$('launch-state').textContent, /Claude/);
     assert.doesNotMatch(restored.$('launch-title').textContent, /Codex/);
     const missing = await mount(t, f, true, { launchRequestId: 'missing_launch_12345678' });

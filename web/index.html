@@ -28,8 +28,10 @@
             <button id="back" class="mobile-only" aria-label="会話一覧へ戻る">← 一覧</button>
             <div class="heading"><h1 id="title">会話を選んでください</h1><p id="project"></p></div>
             <span id="status" class="status"></span>
+            <button id="changes-open" disabled>変更</button>
             <button id="terminal-open" disabled>端末</button>
         </header>
+        <div id="progress-line" hidden><span id="stage"></span><span id="elapsed"></span></div>
         <div id="reading-line"><span id="reading-position">過去の出力から続きを確認できます</span><button id="latest" hidden>新着へ ↓</button></div>
         <section id="history" aria-label="会話履歴" tabindex="0">
             <button id="older" hidden>前の履歴を読む</button>
@@ -53,6 +55,18 @@
             <p id="usage" hidden></p>
         </section>
     </main>
+    <dialog id="changes-dialog" aria-labelledby="changes-title">
+        <header><h2 id="changes-title">作業ツリーの変更</h2><div class="changes-actions"><button id="changes-refresh">更新</button><button id="changes-close">閉じる</button></div></header>
+        <p id="changes-root" class="notice"></p>
+        <label for="changes-file">変更ファイル</label>
+        <select id="changes-file" disabled aria-describedby="changes-state"></select>
+        <p id="changes-state" class="notice" role="status"></p>
+        <p id="changes-path"></p>
+        <p id="changes-detail" class="notice" role="status"></p>
+        <p id="changes-summary" class="notice"></p>
+        <p id="changes-limit" class="notice" role="status"></p>
+        <pre id="changes-diff" tabindex="0" aria-label="選択したファイルの差分" hidden></pre>
+    </dialog>
     <dialog id="launch-dialog" aria-labelledby="launch-title">
         <header><h2 id="launch-title">新しい会話</h2><button id="launch-close">閉じる</button></header>
         <form id="launch-form">
@@ -61,6 +75,17 @@
             <label for="launch-path">PCの作業ディレクトリ</label>
             <input id="launch-path" required maxlength="4096" placeholder="~/git/agent-monitor" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="launch-help launch-state">
             <p id="launch-help" class="notice">PCにある絶対パスか~/で始まるパスを入力します。同じ場所のworkspaceに新しいタブを開きます。</p>
+            <button id="folder-browse" type="button" aria-expanded="false" aria-controls="folder-browser">フォルダを探す</button>
+            <section id="folder-browser" aria-label="PCのフォルダ" hidden>
+                <p id="folder-path" aria-label="表示中のフォルダ" tabindex="-1"></p>
+                <div class="folder-actions"><button id="folder-parent" type="button" disabled>親フォルダへ</button><button id="folder-use" type="button" disabled>このフォルダを使う</button></div>
+                <p id="folder-state" class="notice" role="status"></p>
+                <p id="folder-limit" class="notice" hidden>一覧の一部を表示しています。見つからないフォルダはパスを直接入力できます。</p>
+                <label for="folder-search">現在のフォルダ以下を検索</label>
+                <div class="folder-search"><input id="folder-search" type="search" maxlength="100" placeholder="フォルダ名・相対パス" disabled><button id="folder-search-button" type="button" disabled>検索</button></div>
+                <p id="folder-list-help" class="notice">子フォルダ（タップすると開きます）</p>
+                <div id="folder-list" role="group" aria-labelledby="folder-list-help"></div>
+            </section>
             <button id="launch-submit" type="submit">Codexを起動</button>
         </form>
         <p id="launch-state" class="notice" role="status"></p>

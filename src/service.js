@@ -1,13 +1,14 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { realpath, stat, lstat, mkdir, chmod, open, readdir, unlink, utimes } from 'node:fs/promises';
+import { realpath, stat, lstat, mkdir, chmod, open, opendir, readdir, unlink, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import sharp from 'sharp';
 import { isCodexTui, readPresence, originPort } from './presence.js';
 import { UpstreamError } from './rpc.js';
 import { codexInputState, claudeInputState, codexUsage } from './codex-input.js';
 import { ClaudeReader, isClaudeProcess, claudeMatch, claudeThread } from './claude.js';
+import { readChanges } from './changes.js';
 
 export class HttpError extends Error {
     constructor(status, message) { super(message); this.status = status; }
@@ -138,7 +139,10 @@ async function directoryPath(value) {
         const path = await realpath(expanded);
         if (!(await stat(path)).isDirectory()) throw new Error();
         return path;
-    } catch { throw new HttpError(400, 'PCにあるディレクトリのパスを入力してください。'); }
+    } catch (error) {
+        if (['EACCES', 'EPERM'].includes(error.code)) throw new HttpError(403, 'ディレクトリを読み取れません。PCでアクセス権を確認してください。');
+        throw new HttpError(400, 'PCにあるディレクトリのパスを入力してください。');
+    }
 }
 
 function isInternal(thread) {
@@ -469,6 +473,11 @@ export class MonitorService {
         return current;
     }
 
+    async changes(id, path) {
+        const thread = await this.thread(id);
+        return readChanges(thread.cwd, path);
+    }
+
     async usage(id) {
         const unknown = { contextUsedPercent: null, weeklyLeftPercent: null };
         const sources = await this.sources();
@@ -639,6 +648,78 @@ export class MonitorService {
         })();
         if (wait) await work;
         return record.result;
+    }
+
+    async searchDirectories(input, query) {
+        requireString(query, 100);
+        const needle = query.trim().toLowerCase();
+        const path = await directoryPath(input === null ? homedir() : input);
+        const directories = [], queue = [path];
+        const deadline = performance.now() + 2000;
+        let scanned = 0, truncated = false;
+        for (let cursor = 0; cursor < queue.length; cursor++) {
+            if (cursor > 0 && performance.now() >= deadline) { truncated = true; break; }
+            const current = queue[cursor];
+            try {
+                const info = await lstat(current);
+                if (!info.isDirectory() || info.isSymbolicLink()) {
+                    if (current === path) throw new Error('Search origin is no longer a directory');
+                    truncated = true; continue;
+                }
+                const directory = await opendir(current);
+                try {
+                    while (true) {
+                        if (scanned >= 10000 || directories.length >= 100 || performance.now() >= deadline) {
+                            truncated = true; break;
+                        }
+                        const entry = await directory.read();
+                        if (!entry) break;
+                        scanned++;
+                        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+                        const child = join(current, entry.name), relativePath = relative(path, child);
+                        queue.push(child);
+                        if (relativePath.toLowerCase().includes(needle)) {
+                            directories.push({ name: entry.name, path: child, relativePath });
+                        }
+                    }
+                } finally { await directory.close(); }
+            } catch (error) {
+                if (current !== path) { truncated = true; continue; }
+                if (['EACCES', 'EPERM'].includes(error.code)) throw new HttpError(403, 'ディレクトリを読み取れません。PCでアクセス権を確認してください。');
+                throw new HttpError(400, 'ディレクトリを開けません。PCでパスとアクセス権を確認してください。');
+            }
+            if (scanned >= 10000 || directories.length >= 100) break;
+        }
+        const parent = dirname(path);
+        return { path, parent: parent === path ? null : parent, directories, truncated, query: query.trim() };
+    }
+
+    async directories(input, query = null) {
+        if (query !== null) return this.searchDirectories(input, query);
+        const path = await directoryPath(input === null ? homedir() : input);
+        const directories = [];
+        let scanned = 0, truncated = false;
+        try {
+            const directory = await opendir(path);
+            try {
+                while (scanned < 2000) {
+                    const entry = await directory.read();
+                    if (!entry) break;
+                    scanned++;
+                    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+                        if (directories.length === 200) { truncated = true; break; }
+                        directories.push({ name: entry.name, path: join(path, entry.name) });
+                    }
+                }
+                if (scanned === 2000) truncated = true;
+            } finally { await directory.close(); }
+        } catch (error) {
+            if (['EACCES', 'EPERM'].includes(error.code)) throw new HttpError(403, 'ディレクトリを読み取れません。PCでアクセス権を確認してください。');
+            throw new HttpError(400, 'ディレクトリを開けません。PCでパスとアクセス権を確認してください。');
+        }
+        directories.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+        const parent = dirname(path);
+        return { path, parent: parent === path ? null : parent, directories, truncated };
     }
 
     async launch(body) {
@@ -1008,12 +1089,18 @@ export class MonitorService {
         return { released: true };
     }
 
-    async binding(id, bindingId, owner = 'thread') {
+    async binding(id, bindingId, owner = 'thread', claudeSnapshot) {
         const binding = this.bindings.get(bindingId);
         if (!binding || binding.owner !== owner || binding.id !== id || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
         try {
             const identity = await this.identity(id, binding.paneId, owner);
             if (identity.fingerprint !== binding.fingerprint) throw new HttpError(409, '端末の対象が変わりました。選び直してください。');
+            if (claudeSnapshot && ((identity.pane.agent_session?.value || null) !== claudeSnapshot.hookSession
+                || !claudeLaunchSessionsMatch(identity.pane, identity.process, claudeSnapshot.sessions))) {
+                const launch = this.getLaunch(id);
+                launch.state = 'unknown'; launch.message = '起動したClaudeの会話との対応を確認できません。PCで確認してください。';
+                throw new HttpError(409, launch.message);
+            }
             return binding;
         } catch (error) {
             this.bindings.delete(bindingId);
@@ -1052,6 +1139,7 @@ export class MonitorService {
                 launch.state = 'unknown'; launch.message = '起動したClaudeの会話との対応を確認できません。PCで確認してください。';
                 throw new HttpError(409, launch.message);
             }
+            return { sessions, hookSession: pane.agent_session?.value || null };
         } catch (error) {
             this.bindings.delete(bindingId);
             throw error;
@@ -1076,9 +1164,10 @@ export class MonitorService {
                 if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
                 const { read } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
                 if (createHash('sha256').update(read.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
-                if (claudeLaunch) await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId);
+                const claudeSnapshot = claudeLaunch ? await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId) : null;
                 await this.binding(id, body.bindingId, owner);
                 const { read: latestRead } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
+                await this.binding(id, body.bindingId, owner, claudeSnapshot);
                 if (this.bindings.get(body.bindingId) !== binding || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
                 if (owner === 'launch' && this.getLaunch(id).state !== 'waiting') throw new HttpError(409, '起動状態を更新して端末を選び直してください。');
                 if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
