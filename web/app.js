@@ -204,8 +204,8 @@ function renderFolders() {
     $('folder-path').textContent = folderListing?.path || 'フォルダを選んでください。';
     $('folder-parent').disabled = disabled || folderBusy || !folderListing?.parent;
     $('folder-use').disabled = disabled || folderBusy || !folderListing;
-    $('folder-search').disabled = disabled || !folderListing;
-    $('folder-search-button').disabled = disabled || !folderListing;
+    $('folder-search').disabled = disabled || folderBusy || !folderListing;
+    $('folder-search-button').disabled = disabled || folderBusy || !folderListing;
     $('folder-state').textContent = folderBusy ? 'フォルダを読み込み中…' : folderError
         || (folderListing && !folderListing.truncated && !folderListing.directories.length
             ? (folderListing.query ? '一致するフォルダはありません。' : '子フォルダはありません。') : '');

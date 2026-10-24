@@ -701,6 +701,44 @@ test('folder search supports Enter, result navigation, clearing and stale respon
     assert.equal($('folder-path').textContent, child);
 });
 
+test('folder search waits for the new listing before using the changed launch path', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-search-origin-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const first = join(root, 'first'), second = join(root, 'second');
+    await Promise.all([mkdir(join(first, 'old-project'), { recursive: true }), mkdir(join(second, 'new-project'), { recursive: true })]);
+    const { window, $ } = await mount(t, f, true);
+    $('launch-open').click(); $('launch-path').value = first; $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    const searches = [], fetch = window.fetch;
+    window.fetch = (path, options) => {
+        const url = new URL(path, f.origin);
+        if (url.pathname === '/api/directories' && url.searchParams.has('q')) searches.push(url.searchParams.get('path'));
+        return fetch(path, options);
+    };
+    const held = holdResponse(window, path => new URL(path, f.origin).searchParams.get('path') === second);
+    t.after(() => held.release());
+    $('launch-path').value = second; $('launch-path').dispatchEvent(new window.Event('input'));
+    $('folder-browse').click(); await waitFor(() => held.seen);
+    assert.equal($('folder-path').textContent, first);
+    assert.equal($('folder-list').textContent, 'old-project');
+    $('folder-search').value = 'project';
+    $('folder-search-button').click();
+    $('folder-search').dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    assert.deepEqual(searches, []);
+    assert.equal($('folder-search').disabled, true);
+    assert.equal($('folder-search-button').disabled, true);
+    held.release(); await waitFor(() => held.consumed);
+    await waitFor(() => !$('folder-use').disabled);
+    assert.equal($('folder-path').textContent, second);
+    assert.equal($('folder-search').disabled, false);
+    assert.equal($('folder-search-button').disabled, false);
+    $('folder-search').value = 'project'; $('folder-search-button').click();
+    await waitFor(() => !$('folder-use').disabled && $('folder-list-help').textContent === '検索結果（相対パス）');
+    assert.deepEqual(searches, [second]);
+    assert.equal($('folder-list').textContent, 'new-project');
+});
+
 test('closing launch discards pending folder responses and reopens from the current input', async t => {
     for (const close of ['button', 'escape', 'handoff']) {
         await t.test(close, async t => {
