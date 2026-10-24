@@ -97,6 +97,78 @@ async function mount(t, f, manualPolling = false, stored = {}, count = 2) {
     return { window, $ };
 }
 
+test('attention conversations precede pins, retain first-seen order and return to their groups', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { window, $ } = await mount(t, f);
+    const button = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`);
+    const pin = id => window.document.querySelector(`.pin[data-thread-id="${id}"]`);
+    const layout = () => [...$('thread-list').children].map(element => element.matches('h2') ? element.textContent : element.querySelector('.thread-button').dataset.threadId);
+    const refresh = async () => {
+        const first = $('thread-list').firstChild;
+        window.document.dispatchEvent(new window.Event('visibilitychange'));
+        await waitFor(() => $('thread-list').firstChild !== first);
+    };
+    assert.deepEqual(layout(), ['対応が必要', 'b', '/projects/agent-monitor', 'a']);
+    pin('a').click();
+    assert.deepEqual(layout(), ['対応が必要', 'b', 'ピン留め', 'a']);
+    pin('b').click();
+    assert.deepEqual(layout(), ['対応が必要', 'b', 'ピン留め', 'a']);
+    assert.equal(pin('b').getAttribute('aria-pressed'), 'true');
+    pin('a').click();
+    button('a').click();
+    await waitFor(() => $('status').textContent === '待機中');
+    assert.equal($('composer-terminal').hidden, true);
+    for (const [flag, label] of [
+        ['waitingOnApproval', '承認待ち'],
+        ['waitingOnUserInput', '質問待ち'],
+        ['waitingOnApprovalOrInput', '承認・回答待ち'],
+    ]) {
+        button('a').focus();
+        f.state.threads.get('a').status = { type: 'active', activeFlags: [flag] };
+        await refresh();
+        await waitFor(() => $('status').textContent === label);
+        assert.deepEqual(layout(), ['対応が必要', 'a', 'b']);
+        assert.equal($('composer-terminal').hidden, false);
+        assert.equal(window.document.activeElement, button('a'));
+    }
+    f.state.threads.get('b').status = { type: 'idle' };
+    f.state.panes[1].agent_status = 'idle';
+    pin('b').focus();
+    await refresh();
+    assert.deepEqual(layout(), ['対応が必要', 'a', 'ピン留め', 'b']);
+    assert.equal(window.document.activeElement, pin('b'));
+    assert.equal(pin('b').getAttribute('aria-pressed'), 'true');
+    f.state.threads.get('a').status = { type: 'active', activeFlags: ['otherFlag'] };
+    await refresh();
+    await waitFor(() => $('status').textContent === '作業中');
+    assert.deepEqual(layout(), ['ピン留め', 'b', '/projects/agent-monitor', 'a']);
+    assert.equal($('composer-terminal').hidden, true);
+    pin('b').click();
+    f.state.panes.reverse();
+    await refresh();
+    assert.deepEqual(layout(), ['/projects/agent-monitor', 'a', '/projects/sample-api', 'b']);
+});
+
+test('search shows attention headings only for matching waiting conversations', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const { window, $ } = await mount(t, f, true);
+    const search = query => {
+        $('search').value = query;
+        $('search').dispatchEvent(new window.Event('input'));
+    };
+    search('API');
+    assert.deepEqual([...$('thread-list').querySelectorAll('.project-group')].map(element => element.textContent), ['対応が必要']);
+    assert.deepEqual([...$('thread-list').querySelectorAll('.thread-button')].map(element => element.dataset.threadId), ['b']);
+    search('モバイル');
+    assert.deepEqual([...$('thread-list').querySelectorAll('.project-group')].map(element => element.textContent), ['/projects/agent-monitor']);
+    search('存在しない会話');
+    assert.equal($('thread-list').querySelector('.project-group'), null);
+    assert.equal($('thread-list').querySelector('.thread-button'), null);
+    assert.equal($('thread-list').textContent, '条件に合う会話がありません。');
+    search('');
+    assert.deepEqual([...$('thread-list').querySelectorAll('.thread-button')].map(element => element.dataset.threadId), ['b', 'a']);
+});
+
 test('image upload deadlines allow slow transfers while ordinary API deadlines stay short', async t => {
     const f = await fixture(); t.after(() => f.close());
     const { window, $ } = await mount(t, f, true);

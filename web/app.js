@@ -253,6 +253,10 @@ async function confirmLaunch() {
     finally { launchBusy = false; renderLaunch(); }
 }
 
+function needsAttention(status) {
+    return status?.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+}
+
 function renderList() {
     const focused = document.activeElement;
     const focusedThread = focused?.dataset.threadId;
@@ -260,18 +264,21 @@ function renderList() {
     const scroll = $('thread-list').scrollTop;
     const query = $('search').value.toLocaleLowerCase();
     const visible = threads.filter(thread => `${thread.cwd} ${thread.title} ${thread.preview}`.toLocaleLowerCase().includes(query));
-    visible.sort((a, b) => Number(pins.has(b.id)) - Number(pins.has(a.id)) || ranks.get(a.id) - ranks.get(b.id));
+    const priority = thread => needsAttention(thread.status) ? 2 : Number(pins.has(thread.id));
+    visible.sort((a, b) => priority(b) - priority(a) || ranks.get(a.id) - ranks.get(b.id));
+    const attentionGroup = Symbol();
     const groups = new Map();
     for (const thread of visible) {
-        const key = pins.has(thread.id) ? 'ピン留め' : thread.cwd;
+        const key = needsAttention(thread.status) ? attentionGroup : pins.has(thread.id) ? 'ピン留め' : thread.cwd;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(thread);
     }
     const fragment = document.createDocumentFragment();
     for (const [project, entries] of groups) {
-        fragment.append(node('h2', project || '場所未設定', 'project-group'));
+        const attention = project === attentionGroup;
+        fragment.append(node('h2', attention ? '対応が必要' : project || '場所未設定', `project-group${attention ? ' attention-heading' : ''}`));
         for (const thread of entries) {
-            const row = node('div', undefined, `thread-row${thread.id === selected ? ' selected' : ''}`);
+            const row = node('div', undefined, `thread-row${attention ? ' attention' : ''}${thread.id === selected ? ' selected' : ''}`);
             const button = node('button', undefined, 'thread-button');
             button.dataset.threadId = thread.id;
             button.append(node('span', thread.title, 'thread-title'), node('span', thread.preview, 'thread-preview'));
@@ -474,7 +481,7 @@ function renderComposer() {
         : cache.queue.length ? '待機中の指示があります。処理が終わると送信できます。'
         : idle ? '待機中のPCの会話へ送信します。' : `${stateLabel(cache.thread?.status)}です。端末で状態を確認できます。`);
     $('resolve').hidden = operation?.state !== 'unknown';
-    $('composer-terminal').hidden = cache.closed || !cache.thread?.status.activeFlags?.some(flag => ['waitingOnApproval', 'waitingOnUserInput', 'waitingOnApprovalOrInput'].includes(flag));
+    $('composer-terminal').hidden = cache.closed || !needsAttention(cache.thread?.status);
     $('queue').replaceChildren(...cache.queue.map(item => node('p', `待機中の指示\n${item.text}`)));
     renderQuestions();
     renderUsage();
