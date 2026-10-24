@@ -1,7 +1,8 @@
 :root {
     color-scheme: light;
     --paper: #f4f6fa; --surface: #fff; --ink: #202c38; --muted: #647284; --active: #386e99; --attention: #9a6500;
-    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    --font-ui: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    font-family: var(--font-ui);
     color: var(--ink); background: var(--paper); font-size: 15px;
 }
 * { box-sizing: border-box; }
@@ -102,7 +103,17 @@ dialog select, #terminal-text { width: 100%; margin-bottom: 8px; }
 .changes-actions { display: flex; gap: 6px; flex-shrink: 0; }
 #changes-root, #changes-path { overflow-wrap: anywhere; }
 #changes-path { font-family: SFMono-Regular, Menlo, monospace; font-size: 13px; margin: 12px 0; }
-#changes-diff { max-height: 52dvh; white-space: pre; margin-bottom: 0; }
+#changes-diff { max-height: 52dvh; white-space: normal; margin-bottom: 0; padding: 0; }
+.diff-line { display: flex; width: max-content; min-width: 100%; line-height: 1.7; }
+.diff-text { white-space: pre; padding: 2px 8px; }
+.diff-label { position: sticky; left: 0; flex: 0 0 44px; padding: 2px 6px; font-size: 12px; font-weight: 600; background: inherit; }
+.diff-addition { background: #e6f4e9; color: #205b32; }
+.diff-deletion { background: #fce9e7; color: #842f2b; }
+.diff-context { background: var(--paper); }
+.diff-hunk, .diff-note { background: #e8eff6; color: #43596e; }
+.diff-hunk .diff-text, .diff-note .diff-text { white-space: normal; overflow-wrap: anywhere; max-width: min(750px, 65vw); font-family: var(--font-ui); }
+#changes-summary, #changes-limit { margin: 8px 0; }
+#changes-summary:empty, #changes-limit:empty, #changes-detail:empty { display: none; }
 #changes-state, #changes-detail { margin: 8px 0; }
 #terminal-screen { background: #202c38; color: #eef2f7; min-height: 120px; max-height: 28dvh; white-space: pre; }
 #target-confirm-label { display: flex; align-items: center; gap: 8px; }

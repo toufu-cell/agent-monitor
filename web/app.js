@@ -874,7 +874,44 @@ async function terminalInput(key) {
 
 function closeChanges() {
     changesRequest++;
+    clearChangesDiff();
     if ($('changes-dialog').open) $('changes-dialog').close();
+}
+
+function clearChangesDiff() {
+    $('changes-diff').replaceChildren();
+    $('changes-diff').hidden = true;
+    $('changes-summary').textContent = '';
+    $('changes-limit').textContent = '';
+}
+
+function renderChangesDiff(diff) {
+    const MAX_VISIBLE_LINES = 2000;
+    const lines = diff.split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    const start = lines[0]?.startsWith('--- ') && lines[1]?.startsWith('+++ ') ? 2 : 0;
+    let additions = 0, deletions = 0;
+    const fragment = document.createDocumentFragment();
+    for (let i = start; i < lines.length; i++) {
+        const line = lines[i];
+        const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        const kind = hunk ? 'hunk' : line === '\\ No newline at end of file' ? 'note'
+            : line.startsWith('+') ? 'addition' : line.startsWith('-') ? 'deletion' : 'context';
+        if (kind === 'addition') additions++;
+        if (kind === 'deletion') deletions++;
+        if (i - start >= MAX_VISIBLE_LINES) continue;
+        const row = node('span', '', `diff-line diff-${kind}`);
+        if (kind === 'addition' || kind === 'deletion') row.append(node('span', kind === 'addition' ? '追加' : '削除', 'diff-label'));
+        else if (kind === 'context') row.append(node('span', '', 'diff-label'));
+        const content = kind === 'addition' || kind === 'deletion' || line.startsWith(' ') ? line.slice(1) : line;
+        row.append(node('span', (hunk ? `変更箇所 · ${hunk[2] === '0' ? `変更前${hunk[1]}` : hunk[2]}行目付近`
+            : kind === 'note' ? '注記: 直前の行は末尾に改行がありません。' : content) + '\n', 'diff-text'));
+        fragment.append(row);
+    }
+    $('changes-summary').textContent = `差分全体: 追加${additions}行 · 削除${deletions}行`;
+    if (lines.length - start > MAX_VISIBLE_LINES) $('changes-limit').textContent = `先頭${MAX_VISIBLE_LINES}行だけを表示しています。残りはPCで確認してください。`;
+    $('changes-diff').replaceChildren(fragment);
+    $('changes-diff').hidden = false;
 }
 
 function currentChanges(request, id, captured) {
@@ -885,17 +922,15 @@ async function loadChangesFile() {
     const path = $('changes-file').value;
     const id = selected, captured = generation, request = ++changesRequest;
     $('changes-path').textContent = path;
-    $('changes-diff').textContent = '';
-    $('changes-diff').hidden = true;
+    clearChangesDiff();
     $('changes-detail').textContent = path ? '差分を読み込んでいます…' : '';
     $('changes-detail').classList.remove('error');
     if (!path) return;
     try {
         const result = await api(`threads/${encodeURIComponent(id)}/changes?path=${encodeURIComponent(path)}`);
         if (!currentChanges(request, id, captured)) return;
-        $('changes-detail').textContent = result.message || 'HEADから現在の作業ツリーへの差分です。';
-        $('changes-diff').textContent = result.diff || '';
-        $('changes-diff').hidden = !result.diff;
+        $('changes-detail').textContent = result.message || '';
+        if (result.diff) renderChangesDiff(result.diff);
         $('changes-diff').scrollTop = 0;
         $('changes-diff').scrollLeft = 0;
     } catch (error) {
@@ -914,8 +949,7 @@ async function loadChanges() {
     $('changes-root').textContent = '';
     $('changes-path').textContent = '';
     $('changes-detail').textContent = '';
-    $('changes-diff').textContent = '';
-    $('changes-diff').hidden = true;
+    clearChangesDiff();
     $('changes-state').textContent = '変更ファイルを読み込んでいます…';
     $('changes-state').classList.remove('error');
     try {
@@ -946,7 +980,7 @@ $('changes-open').addEventListener('click', () => {
 });
 $('changes-close').addEventListener('click', closeChanges);
 $('changes-dialog').addEventListener('cancel', event => { event.preventDefault(); closeChanges(); });
-$('changes-dialog').addEventListener('close', () => { if (!$('changes-dialog').open) changesRequest++; });
+$('changes-dialog').addEventListener('close', () => { if (!$('changes-dialog').open) { changesRequest++; clearChangesDiff(); } });
 $('changes-refresh').addEventListener('click', loadChanges);
 $('changes-file').addEventListener('change', loadChangesFile);
 

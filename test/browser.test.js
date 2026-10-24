@@ -43,17 +43,24 @@ test('mobile changes reads real Git diffs with usable headers at narrow widths',
         await page.screenshot({ path: `artifacts/mobile-changes-header-${width}.png`, fullPage: true });
         await page.locator('#changes-open').click();
         await page.locator('#changes-file').selectOption(path);
-        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('+export const ready = true;'));
+        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('export const ready = true;'));
         assert.equal(await page.locator('#changes-diff img').count(), 0);
+        assert.deepEqual(await page.locator('.diff-addition .diff-label').allTextContents(), ['追加', '追加']);
+        assert.deepEqual(await page.locator('.diff-deletion .diff-label').allTextContents(), ['削除']);
+        assert.equal(await page.locator('#changes-summary').textContent(), '差分全体: 追加2行 · 削除1行');
+        assert.notEqual(await page.locator('.diff-addition').first().evaluate(row => getComputedStyle(row).backgroundColor), await page.locator('.diff-deletion').first().evaluate(row => getComputedStyle(row).backgroundColor));
         assert.equal(await page.locator('#changes-dialog').evaluate(dialog => dialog.scrollWidth <= dialog.clientWidth), true);
         for (const id of ['changes-file', 'changes-refresh', 'changes-close']) {
             const box = await page.locator(`#${id}`).boundingBox();
             assert.ok(box.x >= 0 && box.x + box.width <= width && box.height >= 44, id);
         }
         await page.screenshot({ path: `artifacts/mobile-changes-diff-${width}.png`, fullPage: true });
+        await page.locator('#changes-diff').focus();
+        assert.equal(await page.locator('#changes-diff').evaluate(diff => document.activeElement === diff && diff.scrollWidth > diff.clientWidth), true);
+        await page.locator('#changes-diff').press('ArrowRight');
+        await page.waitForFunction(() => document.getElementById('changes-diff').scrollLeft > 0);
         await page.locator('#changes-file').selectOption('new.txt');
-        await page.getByText('HEADから現在の作業ツリーへの差分です。', { exact: true }).waitFor();
-        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('+スマホで新しいファイルを確認します。'));
+        await page.waitForFunction(() => document.getElementById('changes-diff').textContent.includes('スマホで新しいファイルを確認します。'));
         await page.locator('#changes-close').click();
     }
     await page.locator('#back').click(); await page.locator('.thread-button[data-thread-id="b"]').click();
