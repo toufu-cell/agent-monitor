@@ -275,9 +275,10 @@ function renderList() {
     }
     const fragment = document.createDocumentFragment();
     for (const [project, entries] of groups) {
-        fragment.append(node('h2', project === attentionGroup ? '対応が必要' : project || '場所未設定', 'project-group'));
+        const attention = project === attentionGroup;
+        fragment.append(node('h2', attention ? '対応が必要' : project || '場所未設定', `project-group${attention ? ' attention-heading' : ''}`));
         for (const thread of entries) {
-            const row = node('div', undefined, `thread-row${thread.id === selected ? ' selected' : ''}`);
+            const row = node('div', undefined, `thread-row${attention ? ' attention' : ''}${thread.id === selected ? ' selected' : ''}`);
             const button = node('button', undefined, 'thread-button');
             button.dataset.threadId = thread.id;
             button.append(node('span', thread.title, 'thread-title'), node('span', thread.preview, 'thread-preview'));

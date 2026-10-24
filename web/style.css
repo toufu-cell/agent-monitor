@@ -30,14 +30,20 @@ textarea { resize: vertical; width: 100%; max-height: 30dvh; line-height: 1.6; }
 #launch-help, #launch-state { overflow-wrap: anywhere; }
 #thread-list { overflow-y: auto; margin: 0 -16px; padding: 0 10px 30px; }
 .project-group { font-size: 12px; color: var(--muted); margin: 24px 10px 8px; overflow-wrap: anywhere; }
+.project-group.attention-heading { color: var(--attention); font-size: 14px; font-weight: 700; }
 .thread-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px; margin: 5px 0; border-left: 3px solid transparent; border-radius: 3px; }
+.thread-row.attention { border-left-color: var(--attention); background: #fbf5e9; }
 .thread-row.selected { border-left-color: var(--active); background: #e8eff6; }
+.thread-row.attention.selected { border-left-color: var(--attention); }
 .thread-row button { background: transparent; border: 0; text-align: left; border-radius: 3px; }
+.thread-row.attention:not(.selected) .thread-button:hover:enabled { background: #fbf5e9; }
 .thread-row .thread-button { padding: 10px 7px; display: grid; gap: 7px; width: 100%; }
 .thread-title, .thread-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-title { font-weight: 600; font-size: 14px; }
 .thread-preview, .thread-meta { font-size: 12px; color: var(--muted); }
 .thread-meta { display: flex; justify-content: space-between; gap: 8px; }
+.thread-row.attention .thread-meta > span:first-child { color: var(--attention); font-weight: 650; }
+.thread-row.attention.selected .thread-meta > span:first-child { color: #8a5a00; }
 .pin { align-self: start; color: var(--muted); text-align: center !important; font-size: 20px; }
 .pin[aria-pressed="true"] { color: var(--active); }
 #conversation { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
