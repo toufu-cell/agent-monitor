@@ -108,6 +108,24 @@ function processFingerprint(pane, process, owner) {
     });
 }
 
+function launchFingerprint(pane, process, launch) {
+    if (launch.provider !== 'claude') return processFingerprint(pane, process, launch.requestId);
+    const processes = (process.foreground_processes || []).filter(isClaudeProcess);
+    if (processes.length !== 1) return null;
+    const claude = processes[0];
+    return JSON.stringify({
+        owner: ['launch', launch.requestId], pane: pane.pane_id, terminal: pane.terminal_id, tab: pane.tab_id, workspace: pane.workspace_id,
+        shell: process.shell_pid, group: process.foreground_process_group_id,
+        pid: claude.pid, executable: claude.argv0 || claude.argv?.[0] || 'claude',
+    });
+}
+
+function claudeLaunchSessionsMatch(pane, process, sessions) {
+    const claude = process.foreground_processes.filter(isClaudeProcess)[0];
+    const published = sessions.filter(session => session.pid === claude.pid);
+    return !published.length || (published.length === 1 && Boolean(claudeMatch({ ...pane, process }, sessions)));
+}
+
 function uncertain(message) {
     return Object.assign(new Error(message), { uncertain: true });
 }
@@ -402,7 +420,7 @@ export class MonitorService {
         let resources;
         try { resources = currentPanes.length ? await this.presence([...new Set(currentPanes.flatMap(pane => pane.tuis.map(process => process.pid)))]) : new Map(); }
         catch { throw new HttpError(502, 'Codexの現在のOS資源を確認できません。'); }
-        if (!currentPanes.length) return { loaded, panes: matchedClaude, threads: new Map(claudeThreads.map(thread => [thread.id, thread])), unresolvedCount: claudePanes.length - matchedClaude.length };
+        if (!currentPanes.length) return { loaded, panes: matchedClaude, threads: new Map(claudeThreads.map(thread => [thread.id, thread])), claudeSessions: sessions, unresolvedCount: claudePanes.length - matchedClaude.length };
         const candidateIds = [...new Set([...ids, ...[...resources.values()].flatMap(resource => [...resource.threadIds])])];
         const candidates = await boundedMap(candidateIds, async id => {
             try {
@@ -433,7 +451,7 @@ export class MonitorService {
             }));
             return matches.length === 1 ? { ...pane, threadId: matches[0].thread.id } : null;
         }).filter(Boolean);
-        return { loaded, panes: [...matched, ...matchedClaude], threads, unresolvedCount: currentPanes.length - matched.length + claudePanes.length - matchedClaude.length };
+        return { loaded, panes: [...matched, ...matchedClaude], threads, claudeSessions: sessions, unresolvedCount: currentPanes.length - matched.length + claudePanes.length - matchedClaude.length };
     }
 
     async thread(id, sources) {
@@ -707,7 +725,9 @@ export class MonitorService {
     async launch(body) {
         requireOperationId(body.requestId);
         const input = requireString(body.path, 4096);
-        const fingerprint = JSON.stringify(['launch', input]);
+        const provider = body.provider === undefined ? 'codex' : body.provider;
+        if (!['codex', 'claude'].includes(provider)) throw new HttpError(400, '起動するCLIを選んでください。');
+        const fingerprint = JSON.stringify(['launch', input, provider]);
         const existing = this.operations.get(body.requestId);
         if (existing) {
             if (existing.fingerprint !== fingerprint) throw new HttpError(409, '操作IDが別の内容に使用されています。');
@@ -716,7 +736,7 @@ export class MonitorService {
         const path = await directoryPath(input);
         if (this.launches.size >= 1000) throw new HttpError(503, '起動記録が上限に達しました。サーバーを再起動してください。');
         await this.once(body.requestId, fingerprint, async () => {
-            const launch = { requestId: body.requestId, path, state: 'waiting', phase: 'creating', confirmed: false };
+            const launch = { requestId: body.requestId, path, provider, state: 'waiting', phase: 'creating', confirmed: false };
             this.launches.set(body.requestId, launch);
             const creation = this.creationQueue.then(() => this.createLaunchPane(launch));
             this.creationQueue = creation.catch(() => {});
@@ -818,9 +838,13 @@ export class MonitorService {
             if (Date.now() >= deadline) break;
             if (fingerprint && fingerprint === previousFingerprint) {
                 this.assertLaunchAllowed();
-                await this.herdr.call('pane.send_input', { pane_id: launch.pane.pane_id, text: 'env -u CODEX_THREAD_ID codex', keys: ['Enter'] });
+                // Fixed executable and environment flags; cwd is supplied when creating the pane.
+                const command = launch.provider === 'claude'
+                    ? 'env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID claude'
+                    : 'env -u CODEX_THREAD_ID codex';
+                await this.herdr.call('pane.send_input', { pane_id: launch.pane.pane_id, text: command, keys: ['Enter'] });
                 launch.commandSent = true;
-                launch.phase = 'codex';
+                launch.phase = launch.provider;
                 launch.deadline = Date.now() + 30000;
                 return;
             }
@@ -831,10 +855,10 @@ export class MonitorService {
     }
 
     launchSnapshot(launch) {
-        return { requestId: launch.requestId, state: launch.state, phase: launch.phase, path: launch.path,
+        return { requestId: launch.requestId, provider: launch.provider, state: launch.state, phase: launch.phase, path: launch.path,
             message: launch.message, confirmed: launch.confirmed, blockedBy: launch.blockedBy, operation: this.operation(launch.requestId),
             pane: launch.pane ? { id: launch.pane.pane_id, terminalId: launch.pane.terminal_id, tabId: launch.pane.tab_id,
-                workspace: launch.pane.workspace_id, title: '起動したCodex', cwd: launch.path } : null,
+                workspace: launch.pane.workspace_id, title: launch.provider === 'claude' ? '起動したClaude' : '起動したCodex', cwd: launch.path } : null,
             terminalAvailable: launch.state === 'waiting' && Boolean(launch.cliFingerprint), thread: launch.thread };
     }
 
@@ -859,7 +883,7 @@ export class MonitorService {
             if (!['waiting', 'ready'].includes(launch.state)) return this.launchSnapshot(launch);
             if (!identity) { launch.state = 'ended'; return this.launchSnapshot(launch); }
             const { pane, process } = identity;
-            const tuis = (process.foreground_processes || []).filter(isCodexTui);
+            const tuis = (process.foreground_processes || []).filter(launch.provider === 'claude' ? isClaudeProcess : isCodexTui);
             if (!tuis.length) {
                 if (launch.cliFingerprint || Date.now() > launch.deadline) {
                     if ((process.foreground_processes || []).some(p => p.pid !== process.shell_pid)) throw uncertain('起動した端末のプロセスを確認できません。PCで確認してください。');
@@ -867,13 +891,18 @@ export class MonitorService {
                 }
                 return this.launchSnapshot(launch);
             }
-            const fingerprint = processFingerprint(pane, process, id);
-            if (tuis.length !== 1 || (launch.cliFingerprint && launch.cliFingerprint !== fingerprint)) throw uncertain('起動したCodexのプロセスが変わりました。PCで確認してください。');
+            const fingerprint = launchFingerprint(pane, process, launch);
+            if (tuis.length !== 1 || (launch.cliFingerprint && launch.cliFingerprint !== fingerprint)) throw uncertain('起動したCLIのプロセスが変わりました。PCで確認してください。');
             launch.cliFingerprint = fingerprint;
-            const sources = await this.sources();
+            const sources = await this.sources(false, { fresh: launch.provider === 'claude' });
             if (!['waiting', 'ready'].includes(launch.state)) return this.launchSnapshot(launch);
             const matched = sources.panes.find(candidate => samePane(launch.pane, candidate)
-                && processFingerprint(candidate, candidate.process, id) === launch.cliFingerprint);
+                && launchFingerprint(candidate, candidate.process, launch) === launch.cliFingerprint
+                && (sources.threads.get(candidate.threadId)?.provider || 'codex') === launch.provider);
+            if (launch.provider === 'claude' && (!claudeLaunchSessionsMatch(matched || pane, matched?.process || process, sources.claudeSessions)
+                || (!matched && sources.claudeSessions.some(session => session.pid === tuis[0].pid)))) {
+                throw uncertain('起動したClaudeの会話との対応を確認できません。PCで確認してください。');
+            }
             if (!matched && launch.thread) throw uncertain('起動した会話との対応を確認できません。PCで確認してください。');
             if (matched) {
                 if (launch.thread && launch.thread.id !== matched.threadId) throw uncertain('起動した会話の対象が変わりました。PCで確認してください。');
@@ -1026,12 +1055,15 @@ export class MonitorService {
                 launch.state = 'ended';
                 throw new HttpError(409, '起動した端末が終了しました。起動状態を確認してください。');
             }
-            if (!(identity.process.foreground_processes || []).some(isCodexTui)
-                || processFingerprint(identity.pane, identity.process, id) !== launch.cliFingerprint) {
-                launch.state = 'unknown'; launch.message = '起動したCodexの対象が変わりました。PCで確認してください。';
-                throw new HttpError(409, '起動したCodexの対象が変わりました。PCで確認してください。');
+            if ((identity.process.foreground_processes || []).filter(launch.provider === 'claude' ? isClaudeProcess : isCodexTui).length !== 1
+                || launchFingerprint(identity.pane, identity.process, launch) !== launch.cliFingerprint) {
+                launch.state = 'unknown'; launch.message = '起動したCLIの対象が変わりました。PCで確認してください。';
+                throw new HttpError(409, launch.message);
             }
             ({ pane, process } = identity);
+            if (launch.provider === 'claude') {
+                return { pane, process, fingerprint: launch.cliFingerprint };
+            }
         } else {
             if (!this.known.has(id)) throw new HttpError(404, '一覧から会話を選び直してください。');
             const { panes } = sources ?? await this.sources(false, { fresh: true });
@@ -1057,12 +1089,18 @@ export class MonitorService {
         return { released: true };
     }
 
-    async binding(id, bindingId, owner = 'thread') {
+    async binding(id, bindingId, owner = 'thread', claudeSnapshot) {
         const binding = this.bindings.get(bindingId);
         if (!binding || binding.owner !== owner || binding.id !== id || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
         try {
             const identity = await this.identity(id, binding.paneId, owner);
             if (identity.fingerprint !== binding.fingerprint) throw new HttpError(409, '端末の対象が変わりました。選び直してください。');
+            if (claudeSnapshot && ((identity.pane.agent_session?.value || null) !== claudeSnapshot.hookSession
+                || !claudeLaunchSessionsMatch(identity.pane, identity.process, claudeSnapshot.sessions))) {
+                const launch = this.getLaunch(id);
+                launch.state = 'unknown'; launch.message = '起動したClaudeの会話との対応を確認できません。PCで確認してください。';
+                throw new HttpError(409, launch.message);
+            }
             return binding;
         } catch (error) {
             this.bindings.delete(bindingId);
@@ -1078,6 +1116,36 @@ export class MonitorService {
         return { text: read.text, paneId: binding.paneId, viewId };
     }
 
+    async claudeLaunchPaneMatches(pane, process, sessions) {
+        if (!claudeLaunchSessionsMatch(pane, process, sessions)) return false;
+        const session = claudeMatch({ ...pane, process }, sessions);
+        if (!session) return true;
+        const { panes } = await this.herdr.call('pane.list');
+        if (!Array.isArray(panes)) throw new HttpError(502, 'Herdrの端末一覧を読み取れません。');
+        const candidates = await boundedMap(panes, async candidate => {
+            const { process_info: process } = await this.herdr.call('pane.process_info', { pane_id: candidate.pane_id });
+            return claudeMatch({ ...candidate, process }, sessions)?.sessionId === session.sessionId ? candidate : null;
+        });
+        const matches = candidates.filter(Boolean);
+        return matches.length === 1 && samePane(pane, matches[0]);
+    }
+
+    async recheckClaudeLaunchInput(id, bindingId, paneId) {
+        const sessions = await this.claude.sessions({ fresh: true });
+        try {
+            const { pane, process } = await this.identity(id, paneId, 'launch');
+            if (!await this.claudeLaunchPaneMatches(pane, process, sessions)) {
+                const launch = this.getLaunch(id);
+                launch.state = 'unknown'; launch.message = '起動したClaudeの会話との対応を確認できません。PCで確認してください。';
+                throw new HttpError(409, launch.message);
+            }
+            return { sessions, hookSession: pane.agent_session?.value || null };
+        } catch (error) {
+            this.bindings.delete(bindingId);
+            throw error;
+        }
+    }
+
     terminalInput(id, body, owner = 'thread') {
         const hasText = typeof body.text === 'string';
         if (hasText) {
@@ -1091,10 +1159,19 @@ export class MonitorService {
         return this.once(body.requestId, JSON.stringify(['terminal', owner, id, body.bindingId, body.text, body.key]), async () => {
             const binding = await this.binding(id, body.bindingId, owner);
             return this.paneInput(binding.paneId, async () => {
+                const claudeLaunch = owner === 'launch' && this.getLaunch(id).provider === 'claude';
+                if (claudeLaunch) await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId);
                 if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
                 const { read } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
                 if (createHash('sha256').update(read.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
+                const claudeSnapshot = claudeLaunch ? await this.recheckClaudeLaunchInput(id, body.bindingId, binding.paneId) : null;
                 await this.binding(id, body.bindingId, owner);
+                const { read: latestRead } = await this.herdr.call('pane.read', { pane_id: binding.paneId, source: 'visible', format: 'text', strip_ansi: true });
+                await this.binding(id, body.bindingId, owner, claudeSnapshot);
+                if (this.bindings.get(body.bindingId) !== binding || binding.expires < Date.now()) throw new HttpError(409, '端末を選び直してください。');
+                if (owner === 'launch' && this.getLaunch(id).state !== 'waiting') throw new HttpError(409, '起動状態を更新して端末を選び直してください。');
+                if (!binding.view || binding.view.id !== body.viewId || Date.now() - binding.view.at > 30000) throw new HttpError(409, '端末表示を更新してから操作してください。');
+                if (createHash('sha256').update(latestRead.text).digest('hex') !== binding.view.hash) throw new HttpError(409, '端末表示が変わりました。更新して確認してください。');
                 binding.view = null;
                 const key = body.key === 'Ctrl-C' ? 'ctrl+c' : body.key;
                 return this.herdr.call('pane.send_input', { pane_id: binding.paneId, ...(hasText ? { text: body.text } : { keys: [key] }) });

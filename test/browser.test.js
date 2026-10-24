@@ -405,7 +405,7 @@ test('mobile reading, history prepending, new output, draft and terminal workflo
     assert.deepEqual(errors, []);
 });
 
-test('folder picker searches on 320px and 390px touch screens and launches the chosen directory', async t => {
+for (const provider of ['codex', 'claude']) test(`folder picker searches at 320px and 390px and launches ${provider} in the chosen folder`, async t => {
     const f = await fixture(); t.after(() => f.close());
     f.state.initialShellPending = true;
     const root = await realpath(await mkdtemp(join(tmpdir(), 'am-folder-browser-')));
@@ -417,6 +417,7 @@ test('folder picker searches on 320px and 390px touch screens and launches the c
     const page = await browser.newPage({ viewport: { width: 320, height: 740 }, isMobile: true, hasTouch: true });
     await page.goto(`${f.origin}/#${f.token}`);
     await page.locator('#launch-open').tap();
+    await page.locator('#launch-provider').selectOption(provider);
     await page.locator('#launch-path').fill(root);
     await page.locator('#folder-browse').tap();
     await page.getByRole('button', { name: 'group', exact: true }).waitFor();
@@ -431,7 +432,7 @@ test('folder picker searches on 320px and 390px touch screens and launches the c
         assert.equal(f.state.creates.length, 0);
         const layout = await page.evaluate(() => {
             const dialog = document.getElementById('launch-dialog');
-            const ids = ['folder-browse', 'folder-parent', 'folder-use', 'folder-search', 'folder-search-button'];
+            const ids = ['launch-provider', 'launch-path', 'folder-browse', 'folder-parent', 'folder-use', 'folder-search', 'folder-search-button'];
             const controls = [...ids.map(id => document.getElementById(id)), ...document.querySelectorAll('#folder-list button')];
             return { overflow: dialog.scrollWidth > dialog.clientWidth,
                 controls: controls.map(button => { const box = button.getBoundingClientRect(); return { x: box.x, right: box.right, height: box.height }; }),
@@ -442,7 +443,7 @@ test('folder picker searches on 320px and 390px touch screens and launches the c
         assert(layout.controls.every(box => box.x >= 0 && box.right <= width && box.height >= 44));
         assert(layout.actionsBottom <= layout.listTop);
         await mkdir('artifacts', { recursive: true });
-        await page.screenshot({ path: `artifacts/folder-search-${width}.png`, fullPage: true });
+        await page.screenshot({ path: `artifacts/folder-search-${provider}-${width}.png`, fullPage: true });
     }
     await page.locator('#folder-list button').tap();
     await page.waitForFunction(path => document.getElementById('folder-path').textContent === path, child);
@@ -452,12 +453,14 @@ test('folder picker searches on 320px and 390px touch screens and launches the c
     assert.equal(await page.locator('#folder-browser').isHidden(), true);
     const launched = page.waitForResponse(response => response.url() === `${f.origin}/api/launches` && response.request().method() === 'POST');
     await page.locator('#launch-submit').tap();
-    await launched;
+    const response = await launched;
+    assert.equal(response.request().postDataJSON().path, child);
+    assert.equal(response.request().postDataJSON().provider, provider);
     await page.waitForFunction(() => document.getElementById('folder-browse').disabled);
     assert.equal(f.state.creates[0].params.cwd, child);
 });
 
-test('mobile launch validates paths, restores pending state and opens the resolved conversation', async t => {
+for (const provider of ['codex', 'claude']) test(`mobile ${provider} launch restores pending state and opens the conversation`, async t => {
     const f = await fixture(); t.after(() => f.close());
     f.state.launchThread = false;
     const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
@@ -466,20 +469,33 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(`${f.origin}/#${f.token}`);
-    await page.getByRole('button', { name: '新しいCodex会話', exact: true }).click();
+    await page.getByRole('button', { name: '新しい会話', exact: true }).click();
+    assert.equal(await page.locator('#launch-provider').inputValue(), 'codex');
+    await page.locator('#launch-provider').selectOption(provider);
+    const selectBox = await page.locator('#launch-provider').boundingBox();
+    assert(selectBox.height >= 44);
+    assert.equal(await page.locator('#launch-submit').textContent(), provider === 'claude' ? 'Claudeを起動' : 'Codexを起動');
     await page.locator('#launch-path').fill('relative/path');
     await page.locator('#launch-submit').click();
     assert.match(await page.locator('#launch-state').textContent(), /絶対パス/);
     assert.equal(f.state.creates.length, 0);
     await page.locator('#launch-path').fill(process.cwd());
+    const launched = page.waitForResponse(response => response.url() === `${f.origin}/api/launches` && response.request().method() === 'POST');
     await page.locator('#launch-submit').click();
+    const response = await launched;
+    assert.equal(response.request().postDataJSON().path, process.cwd());
+    assert.equal(response.request().postDataJSON().provider, provider);
     await page.waitForFunction(() => !document.getElementById('launch-terminal').hidden);
     const requestId = await page.evaluate(() => sessionStorage.getItem('launchRequestId'));
     assert.equal(await page.locator('#launch-submit').isDisabled(), true);
     await mkdir('artifacts', { recursive: true });
-    await page.screenshot({ path: 'artifacts/mobile-launch.png', fullPage: true });
+    await page.screenshot({ path: `artifacts/mobile-${provider}-launch.png`, fullPage: true });
     await page.reload();
     await page.getByRole('button', { name: '起動状態を確認', exact: true }).click();
+    assert.equal(await page.locator('#launch-provider').inputValue(), provider);
+    assert.equal(await page.locator('#launch-provider').isDisabled(), true);
+    assert.equal(await page.locator('#launch-path').inputValue(), process.cwd());
+    if (provider === 'claude') assert.match(await page.locator('#launch-state').textContent(), /最初の指示.*Enter/);
     await page.locator('#launch-terminal').click();
     assert.equal(await page.locator('#launch-dialog').evaluate(dialog => dialog.open), false);
     const paneId = await page.locator('#pane-select').inputValue();
@@ -488,18 +504,29 @@ test('mobile launch validates paths, restores pending state and opens the resolv
     assert.equal(await page.evaluate(() => sessionStorage.getItem('launchRequestId')), requestId);
     await page.locator('#bind').click();
     await page.waitForFunction(() => !document.getElementById('terminal-send').disabled);
-    await page.screenshot({ path: 'artifacts/mobile-launch-terminal.png', fullPage: true });
+    await page.screenshot({ path: `artifacts/mobile-${provider}-launch-terminal.png`, fullPage: true });
+    if (provider === 'claude') {
+        await page.locator('#terminal-text').fill('起動後の最初の指示');
+        await page.locator('#terminal-send').click();
+        await page.waitForFunction(() => !document.getElementById('terminal-send').disabled);
+        assert.deepEqual(f.state.writes.at(-1), { pane_id: paneId, text: '起動後の最初の指示' });
+    }
     await page.getByRole('button', { name: 'Enter', exact: true }).click();
     await page.waitForFunction(() => document.getElementById('terminal-result').textContent.includes('端末へ送信しました。'));
+    assert.deepEqual(f.state.writes.at(-1), { pane_id: paneId, keys: ['Enter'] });
     await page.locator('#terminal-close').click();
     assert.equal(await page.locator('#launch-dialog').evaluate(dialog => dialog.open), true);
     assert.equal(await page.locator('#terminal-dialog').evaluate(dialog => dialog.open), false);
     const threadId = f.state.resolveLaunch(f.state.panes.find(pane => pane.pane_id === paneId));
     await page.waitForFunction(() => document.getElementById('title').textContent === '新しく起動した会話');
-    await page.locator('#draft').fill('起動後の最初の指示');
+    await page.locator('#draft').fill('会話を開いた後の指示');
     await page.locator('#send').click();
     await page.waitForFunction(() => document.getElementById('draft').value === '');
-    assert.equal(f.state.calls.find(call => call.method === 'thread/queue/add').params.threadId, threadId);
+    if (provider === 'codex') assert.equal(f.state.calls.find(call => call.method === 'thread/queue/add').params.threadId, threadId);
+    else {
+        assert(threadId.startsWith('claude:'));
+        assert.equal(f.state.writes.at(-1).pane_id, paneId);
+    }
     assert.equal(await page.evaluate(() => sessionStorage.getItem('launchRequestId')), null);
     assert.deepEqual(errors, []);
 });

@@ -28,6 +28,7 @@ textarea { resize: vertical; width: 100%; max-height: 30dvh; line-height: 1.6; }
 .notification-actions button { font-size: 13px; }
 #launch-dialog { max-width: 560px; }
 #launch-path { width: 100%; }
+#launch-provider { margin-bottom: 16px; }
 #folder-browse { margin-top: 8px; }
 #folder-browser { border-top: 1px solid #dce3ea; margin-top: 12px; padding-top: 4px; }
 #folder-path { font-size: 13px; overflow-wrap: anywhere; }
@@ -157,6 +158,6 @@ dialog select, #terminal-text { width: 100%; margin-bottom: 8px; }
     #history { padding: 18px 16px; }
     #composer { padding: 10px 12px max(10px, env(safe-area-inset-bottom)); }
     #questions { padding: 10px 12px; }
-    #draft, #launch-path, .question textarea { font-size: 16px; }
+    #draft, #launch-path, #launch-provider, .question textarea { font-size: 16px; }
     .brand { padding-bottom: 18px; }
 }
