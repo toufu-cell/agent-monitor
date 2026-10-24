@@ -588,6 +588,115 @@ function holdResponse(window, matches) {
     return held;
 }
 
+test('changes dialog selects files as text, shows empty states and discards stale reads', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    let mode = 'files';
+    f.service.changes = async (id, path) => {
+        if (path !== null) {
+            if (mode === 'unavailable') return { state: 'unavailable', path, message: '内容を表示できません。' };
+            if (mode === 'deleted') return { state: 'ready', path, diff: `--- a/${path}\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n` };
+            return { state: 'ready', path, diff: mode === 'large'
+                ? `--- a/${path}\n+++ b/${path}\n@@ -1 +1,2500 @@\n-old\n${'+x\n'.repeat(2500)}`
+                : `--- a/${path}\n+++ b/${path}\n@@ -5,3 +9,4 @@\n  common\t\n---old\n-old\n+++new\n+${id}/${path}\n+<img src=x onerror=alert(1)>\n\\ No newline at end of file\n` };
+        }
+        if (mode === 'notGit') return { state: 'notGit', files: [], message: 'この会話の作業ディレクトリはGit管理外です。' };
+        return { state: 'ready', root: '/projects/repo', files: mode === 'empty' ? [] : [
+            { path: 'one.txt', status: ' M' }, { path: 'two.txt', status: '??' },
+        ] };
+    };
+    const { window, $ } = await mount(t, f, true);
+    const select = id => window.document.querySelector(`.thread-button[data-thread-id="${id}"]`).click();
+    select('a'); $('changes-open').click();
+    await waitFor(() => $('changes-diff').textContent.includes('a/one.txt'));
+    assert.equal($('changes-file').options.length, 2);
+    assert.equal($('changes-diff').querySelector('img'), null);
+    assert.equal($('changes-summary').textContent, '差分全体: 追加3行 · 削除2行');
+    assert.deepEqual([...$('changes-diff').querySelectorAll('.diff-label')].map(label => label.textContent), ['', '削除', '削除', '追加', '追加', '追加']);
+    assert.equal($('changes-detail').textContent, '');
+    assert.equal($('changes-diff').querySelector('.diff-context .diff-text').textContent, ' common\t\n');
+    assert.equal($('changes-diff').querySelector('.diff-hunk').textContent, '変更箇所 · 9行目付近\n');
+    assert.match($('changes-diff').querySelector('.diff-note').textContent, /末尾に改行がありません/);
+    assert.deepEqual([...$('changes-diff').querySelectorAll('.diff-deletion .diff-text, .diff-addition .diff-text')].map(text => text.textContent), ['--old\n', 'old\n', '++new\n', 'a/one.txt\n', '<img src=x onerror=alert(1)>\n']);
+    assert.doesNotMatch($('changes-diff').textContent, /--- a\/|\+\+\+ b\//);
+    const choose = path => { $('changes-file').value = path; $('changes-file').dispatchEvent(new window.Event('change')); };
+    const held = holdResponse(window, path => path.includes('/changes?path=one.txt'));
+    choose('one.txt'); await waitFor(() => held.seen);
+    assert.equal($('changes-summary').textContent, '');
+    choose('two.txt'); await waitFor(() => $('changes-diff').textContent.includes('a/two.txt'));
+    held.release(); await waitFor(() => held.consumed);
+    assert.match($('changes-diff').textContent, /a\/two.txt/);
+    for (const transition of ['reopen', 'conversation']) {
+        const stale = holdResponse(window, path => path.includes('/changes?path=one.txt'));
+        choose('one.txt'); await waitFor(() => stale.seen);
+        if (transition === 'reopen') $('changes-close').click();
+        else { select('b'); assert.equal($('changes-dialog').open, false); }
+        $('changes-open').click();
+        await waitFor(() => !$('changes-file').disabled && $('changes-diff').textContent.includes('/one.txt'));
+        choose('two.txt');
+        await waitFor(() => $('changes-diff').textContent.includes(`${transition === 'reopen' ? 'a' : 'b'}/two.txt`));
+        stale.release(); await waitFor(() => stale.consumed);
+        assert.equal($('changes-file').value, 'two.txt');
+        assert.match($('changes-diff').textContent, /\/two.txt/);
+        assert.equal($('changes-summary').textContent, '差分全体: 追加3行 · 削除2行');
+    }
+    mode = 'deleted'; choose('one.txt');
+    await waitFor(() => $('changes-summary').textContent === '差分全体: 追加0行 · 削除2行');
+    assert.equal($('changes-diff').querySelector('.diff-hunk').textContent, '変更箇所 · 変更前1行目付近\n');
+    mode = 'large'; choose('one.txt');
+    await waitFor(() => $('changes-limit').textContent.includes('先頭2000行'));
+    assert.equal($('changes-diff').children.length, 2000);
+    assert.equal($('changes-summary').textContent, '差分全体: 追加2500行 · 削除1行');
+    mode = 'unavailable'; choose('two.txt');
+    await waitFor(() => $('changes-detail').textContent === '内容を表示できません。');
+    assert.equal($('changes-diff').hidden, true);
+    assert.equal($('changes-summary').textContent, '');
+    assert.equal($('changes-limit').textContent, '');
+    mode = 'large'; choose('one.txt');
+    await waitFor(() => $('changes-limit').textContent.includes('先頭2000行'));
+    const staleList = holdResponse(window, path => path.endsWith('/changes'));
+    $('changes-refresh').click(); await waitFor(() => staleList.seen);
+    assert.equal($('changes-summary').textContent, '');
+    assert.equal($('changes-limit').textContent, '');
+    $('changes-close').click(); mode = 'empty'; $('changes-open').click();
+    await waitFor(() => $('changes-state').textContent === '作業ツリーに変更はありません。');
+    staleList.release(); await waitFor(() => staleList.consumed);
+    assert.equal($('changes-file').options.length, 0); assert.equal($('changes-diff').hidden, true);
+    assert.equal($('changes-file').disabled, true);
+    assert.equal($('changes-summary').textContent, '');
+    mode = 'notGit'; $('changes-refresh').click();
+    await waitFor(() => $('changes-state').textContent.includes('Git管理外'));
+});
+
+test('changes dialog closes on thread end and poll failure and discards late responses', async t => {
+    for (const transition of ['ended', 'poll failure']) {
+        await t.test(transition, async t => {
+            const f = await fixture(); t.after(() => f.close());
+            f.service.changes = async (id, path) => path === null
+                ? { state: 'ready', root: '/projects/repo', files: [{ path: 'one.txt', status: ' M' }] }
+                : { state: 'ready', path, diff: '--- a/one.txt\n+++ b/one.txt\n@@ -0,0 +1 @@\n+current content\n' };
+            const { window, $ } = await mount(t, f, true);
+            window.document.querySelector('.thread-button[data-thread-id="a"]').click();
+            await waitFor(() => $('send-state').textContent.includes('待機中のPC'));
+            $('changes-open').click();
+            await waitFor(() => $('changes-diff').textContent.includes('current content'));
+            const stale = holdResponse(window, path => path.includes('/changes?path='));
+            $('changes-file').dispatchEvent(new window.Event('change'));
+            await waitFor(() => stale.seen);
+            if (transition === 'ended') f.state.process.foreground_processes = [{ pid: 100, name: 'zsh', argv: ['zsh'] }];
+            else f.state.failHerdr = true;
+            window.document.dispatchEvent(new window.Event('visibilitychange'));
+            await waitFor(() => transition === 'ended' ? $('status').textContent === '終了' : $('connection').classList.contains('error'));
+            assert.equal($('changes-dialog').open, false);
+            stale.release(); await waitFor(() => stale.consumed);
+            assert.equal($('changes-dialog').open, false);
+            assert.equal($('changes-diff').textContent, '');
+            assert.equal($('changes-diff').hidden, true);
+            assert.equal($('changes-summary').textContent, '');
+            assert.equal($('changes-limit').textContent, '');
+        });
+    }
+});
+
 test('UI retains history and drafts, rejects stale responses, and recovers after errors', async t => {
     const f = await fixture(); t.after(() => f.close());
     const { window, $ } = await mount(t, f);

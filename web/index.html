@@ -28,6 +28,7 @@
             <button id="back" class="mobile-only" aria-label="会話一覧へ戻る">← 一覧</button>
             <div class="heading"><h1 id="title">会話を選んでください</h1><p id="project"></p></div>
             <span id="status" class="status"></span>
+            <button id="changes-open" disabled>変更</button>
             <button id="terminal-open" disabled>端末</button>
         </header>
         <div id="reading-line"><span id="reading-position">過去の出力から続きを確認できます</span><button id="latest" hidden>新着へ ↓</button></div>
@@ -53,6 +54,18 @@
             <p id="usage" hidden></p>
         </section>
     </main>
+    <dialog id="changes-dialog" aria-labelledby="changes-title">
+        <header><h2 id="changes-title">作業ツリーの変更</h2><div class="changes-actions"><button id="changes-refresh">更新</button><button id="changes-close">閉じる</button></div></header>
+        <p id="changes-root" class="notice"></p>
+        <label for="changes-file">変更ファイル</label>
+        <select id="changes-file" disabled aria-describedby="changes-state"></select>
+        <p id="changes-state" class="notice" role="status"></p>
+        <p id="changes-path"></p>
+        <p id="changes-detail" class="notice" role="status"></p>
+        <p id="changes-summary" class="notice"></p>
+        <p id="changes-limit" class="notice" role="status"></p>
+        <pre id="changes-diff" tabindex="0" aria-label="選択したファイルの差分" hidden></pre>
+    </dialog>
     <dialog id="launch-dialog" aria-labelledby="launch-title">
         <header><h2 id="launch-title">新しいCodex会話</h2><button id="launch-close">閉じる</button></header>
         <form id="launch-form">
