@@ -135,8 +135,106 @@ test('Claude launch keeps its terminal when Herdr reports the session before the
     assert.equal((await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).status, 409);
 });
 
+test('Claude launch terminal tolerates metadata changes and transient children through handoff', async t => {
+    const f = await launchFixture(t); f.state.launchThread = false;
+    const requestId = 'launch_claude_metadata_123456';
+    await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+    const waiting = await f.settled(requestId);
+    const endpoint = `/api/launches/${requestId}`;
+    const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
+    const process = f.state.processes.get(pane.pane_id);
+    f.state.failClaude = true;
+    const binding = (await f.request(`${endpoint}/bind`, { paneId: pane.pane_id })).body;
+    Object.assign(process.foreground_processes[0], { name: '2.1.301', argv0: 'claude', argv: ['claude', '--metadata'], cwd: '/changed/metadata' });
+    process.foreground_processes.push({ pid: 9999, name: 'helper', argv: ['helper'], cwd: f.path });
+    const view = await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`);
+    assert.equal(view.status, 200);
+    f.state.failClaude = false;
+    process.foreground_processes[0].argv = ['claude', '--other-metadata'];
+    const sent = await f.request(`${endpoint}/terminal-input`, { requestId: 'claude_metadata_input_123456',
+        bindingId: binding.bindingId, viewId: view.body.viewId, key: 'Enter' });
+    assert.equal(sent.body.state, 'succeeded');
+    assert.equal(f.state.writes.length, 2);
+    assert.equal((await f.status(requestId)).state, 'waiting');
+    const id = f.state.resolveLaunch(pane);
+    f.state.claudeSessions[0].cwd = '/changed/metadata';
+    process.foreground_processes.pop();
+    const publishedView = await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`);
+    assert.equal(publishedView.status, 200);
+    f.state.ignoreCodexMethod = 'thread/loaded/list';
+    const publishedInput = await f.request(`${endpoint}/terminal-input`, { requestId: 'claude_published_input_123456',
+        bindingId: binding.bindingId, viewId: publishedView.body.viewId, key: 'Enter' });
+    assert.equal(publishedInput.body.state, 'succeeded');
+    assert.equal(f.state.writes.length, 3);
+    f.state.ignoreCodexMethod = null;
+    const ready = await f.status(requestId);
+    assert.equal(ready.state, 'ready'); assert.equal(ready.thread.id, id);
+    assert.equal((await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).status, 409);
+});
+
+test('Claude launch rejects a screen changed during session lookup before sending input', async t => {
+    const f = await launchFixture(t); f.state.launchThread = false;
+    const requestId = 'launch_claude_screen_race_123456';
+    await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+    const waiting = await f.settled(requestId);
+    const endpoint = `/api/launches/${requestId}`;
+    const binding = (await f.request(`${endpoint}/bind`, { paneId: waiting.pane.id })).body;
+    const view = (await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).body;
+    const gate = Promise.withResolvers();
+    const entered = Promise.withResolvers();
+    f.state.claudeGate = { ...gate, entered };
+    const pending = f.request(`${endpoint}/terminal-input`, { requestId: 'claude_screen_race_input_123456',
+        bindingId: binding.bindingId, viewId: view.viewId, key: 'Enter' });
+    await entered.promise;
+    f.state.screen = 'Claude Code\nChanged trust prompt';
+    gate.resolve();
+    const sent = await pending;
+    assert.equal(sent.body.state, 'failed');
+    assert.equal(f.state.writes.length, 1);
+});
+
+test('Claude launch terminal rejects changed identity and conflicting sessions before input', async t => {
+    for (const change of ['pid', 'executable', 'argv0', 'group', 'multiple', 'duplicate', 'cwd', 'hook', 'panes']) {
+        await t.test(change, async t => {
+            const f = await launchFixture(t); f.state.launchThread = false;
+            const requestId = `launch_claude_input_${change}_123456`;
+            await f.request('/api/launches', { path: f.path, provider: 'claude', requestId });
+            const waiting = await f.settled(requestId);
+            const endpoint = `/api/launches/${requestId}`;
+            const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
+            const process = f.state.processes.get(pane.pane_id);
+            if (change === 'argv0') {
+                process.foreground_processes[0].argv0 = 'claude';
+            }
+            const binding = (await f.request(`${endpoint}/bind`, { paneId: pane.pane_id })).body;
+            const view = (await f.request(`${endpoint}/terminal?bindingId=${binding.bindingId}`)).body;
+            if (change === 'pid') process.foreground_processes[0].pid++;
+            else if (change === 'executable') process.foreground_processes[0].argv[0] = '/replacement/claude';
+            else if (change === 'argv0') process.foreground_processes[0].argv0 = '/replacement/claude';
+            else if (change === 'group') process.foreground_process_group_id++;
+            else if (change === 'multiple') process.foreground_processes.push({ ...process.foreground_processes[0], pid: 9999 });
+            else {
+                f.state.resolveLaunch(pane);
+                if (change === 'duplicate') f.state.claudeSessions.push({ ...f.state.claudeSessions[0] });
+                if (change === 'cwd') f.state.claudeSessions[0].cwd = '/different/project';
+                if (change === 'hook') pane.agent_session.value = 'different';
+                if (change === 'panes') {
+                    const duplicate = { ...pane, pane_id: 'duplicate:pane', terminal_id: 'duplicate-terminal' };
+                    f.state.panes.push(duplicate);
+                    f.state.processes.set(duplicate.pane_id, structuredClone(process));
+                }
+            }
+            const sent = await f.request(`${endpoint}/terminal-input`, { requestId: 'claude_conflict_input_123456',
+                bindingId: binding.bindingId, viewId: view.viewId, key: 'Enter' });
+            assert.equal(sent.body.state, 'failed');
+            assert.equal(f.state.writes.length, 1);
+            assert.equal((await f.status(requestId)).state, 'unknown');
+        });
+    }
+});
+
 test('Claude launch rejects ambiguous sessions, pane changes and replacement processes', async t => {
-    for (const change of ['ambiguous', 'mismatch', 'pane', 'process', 'multiple']) {
+    for (const change of ['ambiguous', 'mismatch', 'pane', 'process', 'multiple', 'panes']) {
         const f = await launchFixture(t);
         f.state.launchThread = false;
         const body = { path: f.path, provider: 'claude', requestId: `launch_claude_${change}_123456` };
@@ -144,10 +242,15 @@ test('Claude launch rejects ambiguous sessions, pane changes and replacement pro
         const waiting = await f.settled(body.requestId);
         const pane = f.state.panes.find(pane => pane.pane_id === waiting.pane.id);
         const process = f.state.processes.get(pane.pane_id);
-        if (change === 'ambiguous' || change === 'mismatch') {
+        if (['ambiguous', 'mismatch', 'panes'].includes(change)) {
             f.state.resolveLaunch(pane);
             if (change === 'ambiguous') f.state.claudeSessions.push({ ...f.state.claudeSessions[0] });
-            else pane.agent_session.value = 'different';
+            else if (change === 'mismatch') pane.agent_session.value = 'different';
+            else {
+                const duplicate = { ...pane, pane_id: 'duplicate:pane', terminal_id: 'duplicate-terminal' };
+                f.state.panes.push(duplicate);
+                f.state.processes.set(duplicate.pane_id, structuredClone(process));
+            }
         } else if (change === 'pane') pane.terminal_id = 'replacement';
         else if (change === 'process') process.foreground_processes[0].pid++;
         else process.foreground_processes.push({ ...process.foreground_processes[0], pid: 9999 });
