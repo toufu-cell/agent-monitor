@@ -629,6 +629,12 @@ test('folder picker distinguishes incomplete results from an empty directory', a
     assert.equal($('folder-list').querySelectorAll('button').length, 200);
     assert.match($('folder-limit').textContent, /パスを直接入力/);
     assert.equal($('folder-state').textContent, '');
+    $('folder-search').value = 'folder-'; $('folder-search-button').click();
+    await waitFor(() => !$('folder-use').disabled && $('folder-list').childElementCount === 100);
+    assert.equal($('folder-limit').hidden, false);
+    assert.match($('folder-limit').textContent, /検索起点を狭める.*パスを直接入力/);
+    $('folder-search').value = ''; $('folder-search').dispatchEvent(new window.Event('input'));
+    await waitFor(() => !$('folder-use').disabled && $('folder-list').childElementCount === 200);
     $('folder-list').querySelector('button').click();
     await waitFor(() => $('folder-state').textContent === '子フォルダはありません。');
     assert.equal($('folder-limit').hidden, true);
@@ -642,6 +648,59 @@ test('folder picker distinguishes incomplete results from an empty directory', a
     assert.match($('folder-limit').textContent, /上限.*走査した範囲.*パスを直接入力/);
 });
 
+test('folder search supports Enter, result navigation, clearing and stale response rejection', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'am-search-ui-')));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const child = join(root, 'group', 'Project'); await mkdir(child, { recursive: true });
+    const { window, $ } = await mount(t, f, true);
+    const initial = holdResponse(window, path => path.startsWith('/api/directories'));
+    $('launch-open').click(); $('launch-path').value = root; $('folder-browse').click();
+    await waitFor(() => initial.seen);
+    assert.equal($('folder-search').disabled, true);
+    assert.equal($('folder-search-button').disabled, true);
+    initial.release(); await waitFor(() => initial.consumed);
+    await waitFor(() => !$('folder-use').disabled);
+    assert.equal($('folder-search').disabled, false);
+    const search = value => {
+        $('folder-search').value = value;
+        $('folder-search').dispatchEvent(new window.Event('input'));
+        const event = new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+        $('folder-search').dispatchEvent(event);
+        assert.equal(event.defaultPrevented, true);
+    };
+    search('project');
+    await waitFor(() => $('folder-list').textContent === 'group/Project');
+    assert.equal(f.state.creates.length, 0);
+    const held = holdResponse(window, path => path.includes('q=absent'));
+    search('absent'); await waitFor(() => held.seen);
+    $('folder-search').value = ''; $('folder-search').dispatchEvent(new window.Event('input'));
+    await waitFor(() => !$('folder-use').disabled && $('folder-list').textContent === 'group');
+    held.release(); await waitFor(() => held.consumed);
+    assert.equal($('folder-list').textContent, 'group');
+    search('absent'); await waitFor(() => $('folder-state').textContent === '一致するフォルダはありません。');
+    search('project'); await waitFor(() => $('folder-list').textContent === 'group/Project');
+    const fetch = window.fetch;
+    window.fetch = (path, options) => path.includes('q=failed') ? Promise.reject(new Error('Search unavailable')) : fetch(path, options);
+    search('failed'); await waitFor(() => $('folder-state').classList.contains('error'));
+    assert.equal($('folder-list').textContent, 'group/Project');
+    assert.equal($('folder-path').textContent, root);
+    assert.equal($('folder-search').disabled, false);
+    $('folder-list').querySelector('button').click();
+    await waitFor(() => $('folder-path').textContent === child);
+    assert.equal($('folder-search').value, '');
+    $('folder-use').click(); assert.equal($('launch-path').value, child);
+    $('launch-close').click(); $('launch-open').click();
+    window.fetch = (path, options) => path.startsWith('/api/directories') ? Promise.reject(new Error('Listing unavailable')) : fetch(path, options);
+    $('folder-browse').click(); await waitFor(() => $('folder-state').classList.contains('error'));
+    assert.equal($('folder-search').disabled, true);
+    window.fetch = fetch;
+    $('folder-browse').click(); $('folder-browse').click();
+    await waitFor(() => !$('folder-use').disabled);
+    assert.equal($('folder-search').disabled, false);
+    assert.equal($('folder-path').textContent, child);
+});
+
 test('closing launch discards pending folder responses and reopens from the current input', async t => {
     for (const close of ['button', 'escape', 'handoff']) {
         await t.test(close, async t => {
@@ -653,8 +712,9 @@ test('closing launch discards pending folder responses and reopens from the curr
             window.document.querySelector('.thread-button[data-thread-id="a"]').click();
             await waitFor(() => !$('terminal-open').disabled);
             $('launch-open').click(); $('launch-path').value = root;
-            const held = holdResponse(window, path => path.startsWith('/api/directories'));
-            $('folder-browse').click(); await waitFor(() => held.seen);
+            $('folder-browse').click(); await waitFor(() => !$('folder-use').disabled);
+            const held = holdResponse(window, path => path.includes('q=child'));
+            $('folder-search').value = 'child'; $('folder-search-button').click(); await waitFor(() => held.seen);
             if (close === 'button') $('launch-close').click();
             else if (close === 'escape') $('launch-dialog').dispatchEvent(new window.Event('cancel', { cancelable: true }));
             else $('terminal-open').click();
@@ -706,8 +766,9 @@ test('folder picker preserves confirmed navigation and ignores responses after t
     assert.equal($('folder-browser').hidden, true);
     assert.equal(window.document.activeElement.id, 'launch-path');
 
-    const held = holdResponse(window, path => path.startsWith('/api/directories'));
-    $('folder-browse').click(); await waitFor(() => held.seen);
+    $('folder-browse').click(); await waitFor(() => !$('folder-use').disabled);
+    const held = holdResponse(window, path => path.includes('q=child'));
+    $('folder-search').value = 'child'; $('folder-search-button').click(); await waitFor(() => held.seen);
     $('launch-path').value = child; $('launch-path').dispatchEvent(new window.Event('input'));
     held.release(); await waitFor(() => held.consumed);
     assert.equal($('folder-browser').hidden, true);
@@ -721,7 +782,7 @@ test('folder picker preserves confirmed navigation and ignores responses after t
     $('folder-browse').click();
     await waitFor(() => !$('folder-use').disabled);
     const pending = holdResponse(window, path => path.startsWith('/api/directories'));
-    $('folder-list').querySelector('button').click(); await waitFor(() => pending.seen);
+    $('folder-search').value = 'child'; $('folder-search-button').click(); await waitFor(() => pending.seen);
     $('launch-form').dispatchEvent(new window.Event('submit', { cancelable: true }));
     assert.equal($('folder-browse').disabled, true);
     assert.equal($('folder-use').disabled, true);

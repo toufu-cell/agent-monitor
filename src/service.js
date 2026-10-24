@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { realpath, stat, lstat, mkdir, chmod, open, opendir, readdir, unlink, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import sharp from 'sharp';
 import { isCodexTui, readPresence, originPort } from './presence.js';
@@ -626,7 +626,52 @@ export class MonitorService {
         return record.result;
     }
 
-    async directories(input) {
+    async searchDirectories(input, query) {
+        requireString(query, 100);
+        const needle = query.trim().toLowerCase();
+        const path = await directoryPath(input === null ? homedir() : input);
+        const directories = [], queue = [path];
+        const deadline = performance.now() + 2000;
+        let scanned = 0, truncated = false;
+        for (let cursor = 0; cursor < queue.length; cursor++) {
+            if (cursor > 0 && performance.now() >= deadline) { truncated = true; break; }
+            const current = queue[cursor];
+            try {
+                const info = await lstat(current);
+                if (!info.isDirectory() || info.isSymbolicLink()) {
+                    if (current === path) throw new Error('Search origin is no longer a directory');
+                    truncated = true; continue;
+                }
+                const directory = await opendir(current);
+                try {
+                    while (true) {
+                        if (scanned >= 10000 || directories.length >= 100 || performance.now() >= deadline) {
+                            truncated = true; break;
+                        }
+                        const entry = await directory.read();
+                        if (!entry) break;
+                        scanned++;
+                        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+                        const child = join(current, entry.name), relativePath = relative(path, child);
+                        queue.push(child);
+                        if (relativePath.toLowerCase().includes(needle)) {
+                            directories.push({ name: entry.name, path: child, relativePath });
+                        }
+                    }
+                } finally { await directory.close(); }
+            } catch (error) {
+                if (current !== path) { truncated = true; continue; }
+                if (['EACCES', 'EPERM'].includes(error.code)) throw new HttpError(403, 'ディレクトリを読み取れません。PCでアクセス権を確認してください。');
+                throw new HttpError(400, 'ディレクトリを開けません。PCでパスとアクセス権を確認してください。');
+            }
+            if (scanned >= 10000 || directories.length >= 100) break;
+        }
+        const parent = dirname(path);
+        return { path, parent: parent === path ? null : parent, directories, truncated, query: query.trim() };
+    }
+
+    async directories(input, query = null) {
+        if (query !== null) return this.searchDirectories(input, query);
         const path = await directoryPath(input === null ? homedir() : input);
         const directories = [];
         let scanned = 0, truncated = false;

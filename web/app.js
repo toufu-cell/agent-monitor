@@ -190,6 +190,7 @@ function invalidateFolders() {
 function closeLaunch() {
     invalidateFolders();
     folderListing = null; folderError = '';
+    $('folder-search').value = '';
     $('folder-browser').hidden = true;
     $('folder-list').replaceChildren();
     renderFolders();
@@ -203,28 +204,38 @@ function renderFolders() {
     $('folder-path').textContent = folderListing?.path || 'フォルダを選んでください。';
     $('folder-parent').disabled = disabled || folderBusy || !folderListing?.parent;
     $('folder-use').disabled = disabled || folderBusy || !folderListing;
+    $('folder-search').disabled = disabled || !folderListing;
+    $('folder-search-button').disabled = disabled || !folderListing;
     $('folder-state').textContent = folderBusy ? 'フォルダを読み込み中…' : folderError
-        || (folderListing && !folderListing.truncated && !folderListing.directories.length ? '子フォルダはありません。' : '');
+        || (folderListing && !folderListing.truncated && !folderListing.directories.length
+            ? (folderListing.query ? '一致するフォルダはありません。' : '子フォルダはありません。') : '');
     $('folder-state').classList.toggle('error', Boolean(folderError));
     $('folder-limit').hidden = !folderListing?.truncated;
-    $('folder-limit').textContent = folderListing?.directories.length
+    $('folder-list-help').textContent = folderListing?.query ? '検索結果（相対パス）' : '子フォルダ（タップすると開きます）';
+    $('folder-limit').textContent = folderListing?.query
+        ? '検索結果の一部を表示しています。上限に達したか、読み取れない子フォルダがあります。検索起点を狭めるか、パスを直接入力してください。'
+        : folderListing?.directories.length
         ? '一覧の一部を表示しています。見つからないフォルダはパスを直接入力できます。'
         : '一覧の取得が上限に達しました。走査した範囲に子フォルダはありません。パスを直接入力できます。';
     $('folder-list').setAttribute('aria-busy', String(folderBusy));
     for (const button of $('folder-list').querySelectorAll('button')) button.disabled = disabled || folderBusy;
 }
 
-async function browseFolders(path) {
+async function browseFolders(path, query = '') {
     if ($('launch-path').disabled) return;
     const request = ++folderRequest;
     const focusInList = $('folder-list').contains(document.activeElement);
     folderBusy = true; folderError = ''; renderFolders();
     try {
-        const listing = await api(`directories${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+        const params = new URLSearchParams();
+        if (path) params.set('path', path);
+        if (query) params.set('q', query);
+        const listing = await api(`directories?${params}`);
         if (request !== folderRequest) return;
         folderListing = listing;
+        if (!query) $('folder-search').value = '';
         $('folder-list').replaceChildren(...listing.directories.map(directory => {
-            const button = node('button', directory.name);
+            const button = node('button', directory.relativePath || directory.name);
             button.type = 'button';
             button.addEventListener('click', () => browseFolders(directory.path));
             return button;
@@ -941,6 +952,20 @@ $('folder-browse').addEventListener('click', () => {
 });
 $('folder-parent').addEventListener('click', () => {
     if (!$('folder-parent').disabled) browseFolders(folderListing.parent);
+});
+function searchFolders() {
+    if ($('folder-search').disabled || !folderListing) return;
+    const query = $('folder-search').value.trim();
+    browseFolders(folderListing.path, query);
+}
+$('folder-search-button').addEventListener('click', searchFolders);
+$('folder-search').addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); searchFolders(); }
+});
+$('folder-search').addEventListener('input', () => {
+    invalidateFolders(); folderError = '';
+    if (!$('folder-search').value.trim() && folderListing?.query) browseFolders(folderListing.path);
+    else renderFolders();
 });
 $('folder-use').addEventListener('click', () => {
     if ($('folder-use').disabled) return;

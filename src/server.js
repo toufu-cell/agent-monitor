@@ -87,7 +87,7 @@ export function createMonitorServer({ service, notifications, token, tailscaleLo
                     throw new HttpError(404, 'APIが見つかりません。');
                 }
                 if (request.method === 'GET') {
-                    if (url.pathname === '/api/directories') return json(200, await service.directories(url.searchParams.get('path')));
+                    if (url.pathname === '/api/directories') return json(200, await service.directories(url.searchParams.get('path'), url.searchParams.get('q')));
                     if (url.pathname === '/api/threads') return json(200, await service.list());
                     if (resource === 'operations' && segments.length === 3) return json(200, service.operation(id));
                     if (resource === 'launches' && segments.length === 3) return json(200, await service.launchStatus(id));

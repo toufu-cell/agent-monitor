@@ -65,6 +65,8 @@
                 <div class="folder-actions"><button id="folder-parent" type="button" disabled>親フォルダへ</button><button id="folder-use" type="button" disabled>このフォルダを使う</button></div>
                 <p id="folder-state" class="notice" role="status"></p>
                 <p id="folder-limit" class="notice" hidden>一覧の一部を表示しています。見つからないフォルダはパスを直接入力できます。</p>
+                <label for="folder-search">現在のフォルダ以下を検索</label>
+                <div class="folder-search"><input id="folder-search" type="search" maxlength="100" placeholder="フォルダ名・相対パス" disabled><button id="folder-search-button" type="button" disabled>検索</button></div>
                 <p id="folder-list-help" class="notice">子フォルダ（タップすると開きます）</p>
                 <div id="folder-list" role="group" aria-labelledby="folder-list-help"></div>
             </section>

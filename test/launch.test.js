@@ -80,6 +80,53 @@ test('directory browsing bounds returned directories and scanned files with an i
     assert.equal(scanned.truncated, true);
 });
 
+test('directory search authenticates and searches relative paths below its origin without following links', async t => {
+    const f = await launchFixture(t);
+    const endpoint = (q, path = f.path) => `/api/directories?path=${encodeURIComponent(path)}&q=${encodeURIComponent(q)}`;
+    assert.equal((await f.request(endpoint('project'), undefined, { Authorization: '' })).status, 401);
+    assert.equal((await f.request(endpoint('project'), undefined, { Origin: 'https://evil.example' })).status, 403);
+    for (const q of ['', '  ', 'a'.repeat(101)]) assert.equal((await f.request(endpoint(q))).status, 400);
+    await mkdir(join(f.path, 'Project', 'nested'), { recursive: true });
+    await mkdir(join(f.path, 'other'));
+    await writeFile(join(f.path, 'project-file'), 'project');
+    await symlink(join(f.path, 'Project'), join(f.path, 'project-alias'));
+    const result = (await f.request(endpoint(' PROJECT '))).body;
+    assert.equal(result.truncated, false);
+    assert.deepEqual(result.directories.map(d => d.relativePath), ['Project', 'Project/nested']);
+    assert(result.directories.every(d => d.path === join(f.path, d.relativePath)));
+    assert.deepEqual((await f.request(endpoint('project', join(f.path, 'other')))).body.directories, []);
+    assert.deepEqual((await f.request(endpoint('JECT/Ne'))).body.directories.map(d => d.relativePath), ['Project/nested']);
+    await chmod(join(f.path, 'Project'), 0);
+    try {
+        if (process.getuid?.() !== 0) {
+            assert.equal((await f.request(endpoint('absent'))).body.truncated, true);
+            assert.equal((await f.request(endpoint('project', join(f.path, 'Project')))).status, 403);
+        }
+    } finally { await chmod(join(f.path, 'Project'), 0o700); }
+    assert.equal(f.state.creates.length, 0);
+    assert.equal(f.state.writes.length, 0);
+});
+
+test('directory search reports partial results at result, scan and time limits', async t => {
+    const f = await launchFixture(t);
+    await Promise.all(Array.from({ length: 101 }, (_, i) => mkdir(join(f.path, `match-${i}`))));
+    const matches = (await f.request(`/api/directories?path=${encodeURIComponent(f.path)}&q=match`)).body;
+    assert.equal(matches.directories.length, 100);
+    assert.equal(matches.truncated, true);
+    const files = join(f.path, 'files'); await mkdir(files);
+    await Promise.all(Array.from({ length: 10001 }, (_, i) => writeFile(join(files, `file-${i}`), '')));
+    const clock = t.mock.method(performance, 'now', () => 0);
+    const scanned = (await f.request(`/api/directories?path=${encodeURIComponent(files)}&q=absent`)).body;
+    assert.deepEqual(scanned.directories, []);
+    assert.equal(scanned.truncated, true);
+    clock.mock.restore();
+    let now = 0;
+    t.mock.method(performance, 'now', () => now += 1100);
+    const timed = await f.service.directories(f.path, 'absent');
+    assert.deepEqual(timed.directories, []);
+    assert.equal(timed.truncated, true);
+});
+
 test('launch authentication and path validation keep paths out of shell commands', async t => {
     const f = await launchFixture(t);
     const { request, state } = f;
