@@ -55,6 +55,42 @@ test('changes HTTP reads HEAD to worktree across staged, unstaged and literal re
     assert.equal((await f.detail('tracked.txt')).body.diff.includes('untracked.html'), false);
 });
 
+test('changes HTTP honors global excludes and local overrides without running global programs', async t => {
+    const f = await changesFixture(t);
+    const directory = await mkdtemp(join(tmpdir(), 'am-global-excludes-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const previousGlobal = process.env.GIT_CONFIG_GLOBAL;
+    t.after(() => {
+        if (previousGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+        else process.env.GIT_CONFIG_GLOBAL = previousGlobal;
+    });
+    const globalConfig = join(directory, 'gitconfig');
+    const globalExcludes = join(directory, 'global ignore');
+    const localExcludes = join(directory, 'local ignore');
+    const sentinel = join(directory, 'program-ran');
+    await writeFile(globalExcludes, 'global-secret.txt\n');
+    await writeFile(localExcludes, 'local-secret.txt\n');
+    await f.git('config', '--file', globalConfig, 'core.excludesFile', globalExcludes);
+    for (const key of ['core.fsmonitor', 'core.pager', 'filter.tripwire.clean', 'diff.external']) {
+        await f.git('config', '--file', globalConfig, key, `touch '${sentinel}'`);
+    }
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    for (const name of ['global-secret.txt', 'local-secret.txt', 'visible.txt']) {
+        await writeFile(join(f.root, name), `content of ${name}\n`);
+    }
+    const globalList = await f.request('/api/threads/a/changes');
+    assert.equal(globalList.status, 200);
+    assert.deepEqual(globalList.body.files.map(file => file.path).sort(), ['local-secret.txt', 'visible.txt']);
+    assert.equal((await f.detail('global-secret.txt')).status, 409);
+    await f.git('config', 'core.excludesFile', localExcludes);
+    const localList = await f.request('/api/threads/a/changes');
+    assert.equal(localList.status, 200);
+    assert.deepEqual(localList.body.files.map(file => file.path).sort(), ['global-secret.txt', 'visible.txt']);
+    assert.equal((await f.detail('local-secret.txt')).status, 409);
+    assert.match((await f.detail('global-secret.txt')).body.diff, /\+content of global-secret.txt/);
+    assert.equal((await readdir(directory)).includes('program-ran'), false);
+});
+
 test('changes HTTP reads HEAD deletions when a parent directory becomes a file', async t => {
     const f = await changesFixture(t);
     const paths = ['dir/old.txt', 'dir/nested/old.txt'];

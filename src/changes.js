@@ -27,19 +27,26 @@ function limited(error) { return error.killed || error.code === 'ERR_CHILD_PROCE
 
 function gitReader() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+    const configEnv = { ...env };
+    for (const key of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']) {
+        if (process.env[key] !== undefined) configEnv[key] = process.env[key];
+    }
     Object.assign(env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_ATTR_NOSYSTEM: '1',
         GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' });
     const options = ['--no-pager', '--no-optional-locks', '--literal-pathspecs',
         '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null',
         '-c', 'submodule.recurse=false', '-c', 'protocol.allow=never'];
     const deadline = Date.now() + 8000;
-    const git = async (cwd, args, maxBuffer = MAX_OUTPUT_BYTES, acceptedCodes = []) => {
+    const git = async (cwd, args, maxBuffer = MAX_OUTPUT_BYTES, acceptedCodes = [], environment = env) => {
         const timeout = Math.min(TIMEOUT, deadline - Date.now());
         if (timeout <= 0) throw Object.assign(new Error(LIMIT_MESSAGE), { code: 'ETIMEDOUT' });
-        try { return (await execute('git', [...options, ...args], { cwd, env, encoding: 'buffer', timeout, maxBuffer })).stdout; }
+        try { return (await execute('git', [...options, ...args], { cwd, env: environment, encoding: 'buffer', timeout, maxBuffer })).stdout; }
         catch (error) { if (acceptedCodes.includes(error.code)) return error.stdout; throw error; }
     };
-    git.disableFilters = async cwd => {
+    git.prepare = async cwd => {
+        // Preserve the effective ignore path while isolating all other global configuration.
+        const excludes = await git(cwd, ['config', '--null', '--path', '--get', 'core.excludesFile'], 64 * 1024, [1], configEnv);
+        if (excludes.length) options.push('-c', `core.excludesFile=${excludes.toString('utf8').replace(/\0$/, '')}`);
         // status can invoke clean filters while checking the index against the worktree.
         const keys = await git(cwd, ['config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'], 64 * 1024, [1]);
         for (const key of keys.toString('utf8').split('\0').filter(Boolean)) {
@@ -130,7 +137,7 @@ export async function readChanges(cwd, path = null) {
         if (!cwd || !isAbsolute(cwd)) return { state: 'notGit', files: [], message: 'この会話の作業ディレクトリはGit管理外です。' };
         root = (await git(cwd, ['rev-parse', '--show-toplevel'])).toString('utf8').replace(/\n$/, '');
         root = await realpath(root);
-        await git.disableFilters(root);
+        await git.prepare(root);
         const status = await git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames', '--ignore-submodules=all']);
         let decoded;
         try { decoded = new TextDecoder('utf-8', { fatal: true }).decode(status); }
