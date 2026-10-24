@@ -537,7 +537,8 @@ function renderComposer() {
     const operation = pending[selected];
     const image = images.get(selected);
     const missingImage = imageDrafts[selected] && !image;
-    $('status').textContent = cache.closed ? '終了' : stateLabel(cache.thread?.status);
+    $('status').textContent = cache.closed ? '終了' : stateLabel(cache.stateReady ? cache.thread?.status : null);
+    renderProgress(cache);
     $('terminal-open').disabled = Boolean(cache.closed);
     $('changes-open').disabled = Boolean(cache.closed);
     const idle = cache.stateReady && cache.thread?.status.type === 'idle' && !cache.queue.length;
@@ -563,6 +564,22 @@ function renderComposer() {
     $('queue').replaceChildren(...cache.queue.map(item => node('p', `待機中の指示\n${item.text}`)));
     renderQuestions();
     renderUsage();
+}
+
+function renderProgress(cache) {
+    const claude = cache.thread?.provider === 'claude';
+    const visible = !cache.closed && cache.stateReady && (claude || cache.historyReady) && cache.thread?.status.type === 'active';
+    const turn = visible && !claude ? cache.turns.find(turn => turn.id === cache.activeTurnId && turn.status === 'inProgress') : null;
+    const tool = turn?.items.findLast(item => !['userMessage', 'agentMessage', 'plan'].includes(item.type) && ['inProgress', 'running'].includes(item.status));
+    const waiting = needsAttention(cache.thread?.status);
+    $('stage').hidden = !visible || Boolean(waiting);
+    $('stage').textContent = $('stage').hidden ? '' : tool ? 'ツール実行中' : '作業中';
+    const startedAt = turn?.startedAt;
+    const elapsed = Date.now() - startedAt * 1000;
+    const confirmed = turn?.items.filter(item => item.type === 'userMessage').length === 1 && typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0 && Number.isFinite(elapsed) && elapsed >= 0;
+    $('elapsed').hidden = !confirmed;
+    $('elapsed').textContent = confirmed ? `指示から${Math.floor(elapsed / 60000)}分経過` : '';
+    $('progress-line').hidden = $('stage').hidden && $('elapsed').hidden;
 }
 
 function questionKey(id, question) { return JSON.stringify([id, question.turnId, question.itemId, question.index]); }
@@ -673,7 +690,17 @@ async function refreshSelected() {
     try {
         const until = cache.turns.at(-1)?.id;
         const [state, history] = await Promise.allSettled([
-            api(`threads/${encodeURIComponent(id)}/state`),
+            api(`threads/${encodeURIComponent(id)}/state`).then(value => {
+                if (value.thread.provider === 'claude' && currentSelection(selected, generation, id, captured)) {
+                    cache.thread = value.thread; cache.stateReady = true; renderComposer();
+                }
+                return value;
+            }, error => {
+                if (cache.thread?.provider === 'claude' && currentSelection(selected, generation, id, captured)) {
+                    cache.stateReady = false; renderComposer();
+                }
+                throw error;
+            }),
             api(`threads/${encodeURIComponent(id)}/history${until ? `?until=${encodeURIComponent(until)}` : ''}`),
         ]);
         if (!currentSelection(selected, generation, id, captured)) return;

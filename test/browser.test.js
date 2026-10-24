@@ -9,6 +9,34 @@ import { chromium } from 'playwright';
 import { fixture, codexScreen, claudeScreen } from './fakes.js';
 import { notificationFixture } from './notification-fixture.js';
 
+test('active progress keeps elapsed text visible at 320px', async t => {
+    const f = await fixture(); t.after(() => f.close());
+    const turn = f.state.turns.get('a').at(-1);
+    turn.status = 'inProgress'; turn.startedAt = Date.now() / 1000 - 120;
+    turn.items.find(item => item.type === 'commandExecution').status = 'inProgress';
+    f.state.threads.get('a').status = { type: 'active', activeFlags: [] };
+    f.state.panes[0].agent_status = 'working';
+    const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 320, height: 720 }, isMobile: true, hasTouch: true });
+    await page.goto(`${f.origin}/#${f.token}`);
+    await page.locator('.thread-button[data-thread-id="a"]').click();
+    await page.waitForFunction(() => !document.getElementById('progress-line').hidden && !document.getElementById('elapsed').hidden);
+    assert.match(await page.locator('#elapsed').textContent(), /指示から\d+分経過/);
+    assert.equal(await page.locator('#elapsed').evaluate(element => {
+        const box = element.getBoundingClientRect();
+        return box.left >= 0 && box.right <= innerWidth && element.scrollWidth <= element.clientWidth;
+    }), true);
+    assert.equal(await page.locator('#progress-line').evaluate(element => {
+        const header = document.querySelector('.conversation-header').getBoundingClientRect();
+        const reading = document.getElementById('reading-line').getBoundingClientRect();
+        const box = element.getBoundingClientRect();
+        return box.top >= header.bottom && box.bottom <= reading.top;
+    }), true);
+    await mkdir('artifacts', { recursive: true });
+    await page.screenshot({ path: 'artifacts/mobile-stage-timer-320.png', fullPage: true });
+});
+
 test('mobile changes reads real Git diffs with usable headers at narrow widths', async t => {
     const f = await fixture(); t.after(() => f.close());
     const root = await mkdtemp(join(tmpdir(), 'am-browser-changes-'));

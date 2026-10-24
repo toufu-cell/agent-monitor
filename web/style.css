@@ -62,6 +62,9 @@ textarea { resize: vertical; width: 100%; max-height: 30dvh; line-height: 1.6; }
 h1 { font-size: 17px; margin: 0 0 6px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #project { color: var(--muted); font-size: 12px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status { font-size: 12px; white-space: nowrap; }
+#progress-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 7px 25px; color: var(--muted); font-size: 12px; border-bottom: 1px solid #e3e8ee; }
+#stage { overflow-wrap: anywhere; }
+#elapsed { white-space: nowrap; font-variant-numeric: tabular-nums; }
 #reading-line { min-height: 44px; padding: 0 25px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; background: var(--paper); }
 #latest { border: 0; color: var(--active); font-weight: 600; background: transparent; }
 #history { overflow-y: auto; flex: 1; min-height: 0; overscroll-behavior: contain; padding: 22px max(25px, calc((100% - 820px) / 2)); overflow-anchor: none; }
@@ -150,6 +153,7 @@ dialog select, #terminal-text { width: 100%; margin-bottom: 8px; }
     #changes-dialog h2 { font-size: 16px; }
     #changes-file { font-size: 16px; min-width: 0; }
     #reading-line { padding: 0 16px; }
+    #progress-line { padding: 7px 16px; }
     #history { padding: 18px 16px; }
     #composer { padding: 10px 12px max(10px, env(safe-area-inset-bottom)); }
     #questions { padding: 10px 12px; }
